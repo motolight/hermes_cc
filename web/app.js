@@ -1,7 +1,7 @@
 import { avatar, esc, icon, relTime, safeHref, statusChip } from './ui.js';
 import { bindGraph, renderGraph } from './graph.js';
 import { bindView, renderView } from './views.js';
-import { readLive, readHistory, readTaskDetail, emptyData } from './live.js';
+import { emptyData, isAccessDenied, readHistory, readLive, readTaskDetail, sidecarError } from './live.js';
 
 const pages = {
   graph: ['Live Agent Graph', 'Граф агентов', 'Agent topology and recent handoffs', 'Связи агентов и недавние передачи задач'],
@@ -23,11 +23,13 @@ const savePref = (key, value) => {
 
 const params = new URLSearchParams(location.search);
 const embedded = parent !== window && location.protocol === 'about:';
+const STALE_WINDOW = 45000;
+const RETRY_DELAY = 2000;
 const state = {
   view: 'graph', theme: readPref('theme') === 'light' ? 'light' : 'dark',
   lang: readPref('lang') === 'ru' ? 'ru' : 'en',
   demo: params.get('demo') === '1', data: emptyData(), filters: {}, histories: new Map(),
-  updated: null, polling: false, pending: false, cleanup: null, closed: false, epoch: 0,
+  updated: null, failure: null, expiry: null, polling: false, pending: false, cleanup: null, closed: false, epoch: 0,
 };
 let demoModule;
 let returnFocus;
@@ -55,7 +57,7 @@ function canRenderRefresh() {
 }
 
 async function loadHistory(range, force = false) {
-  if (!state.demo && !state.data.access) return null;
+  if (!state.demo && (!state.data.access || state.failure)) return null;
   const existing = state.histories.get(range);
   if (existing?.request) return existing.request;
   if (!force && existing && Date.now() - existing.time < 30000) return existing.value;
@@ -63,7 +65,10 @@ async function loadHistory(range, force = false) {
   const pending = Promise.resolve().then(async () => {
     if (state.demo) return (demoModule ||= await import('./demo.js')).demoHistory(range);
     return readHistory(range);
-  }).catch(() => ({range, error: true})).then(value => {
+  }).catch(error => {
+    handleAccessDenial(error, epoch);
+    return {range, error: true};
+  }).then(value => {
     if (epoch !== state.epoch || state.closed) return null;
     state.histories.set(range, {value, time: Date.now()});
     if (['usage', 'infrastructure'].includes(state.view) && currentRange() === range) {
@@ -81,12 +86,18 @@ const ctx = {
   get lang() { return state.lang; },
   get data() { return {...state.data, history: state.histories.get(currentRange())?.value || null}; },
   get demo() { return state.demo; },
-  get loading() { return !state.updated; },
+  get loading() { return !state.updated && !state.failure; },
   async taskDetail(id) {
     if (state.demo) return (demoModule ||= await import('./demo.js')).demoTaskDetail(id);
-    if (!state.data.access) throw new Error('Task detail unavailable');
+    if (!state.data.access || state.failure) throw new Error('Task detail unavailable');
     const epoch = state.epoch;
-    const result = await readTaskDetail(id);
+    let result;
+    try {
+      result = await readTaskDetail(id);
+    } catch (error) {
+      handleAccessDenial(error, epoch);
+      throw error;
+    }
     if (epoch !== state.epoch || !state.data.access) throw new Error('Task detail unavailable');
     return result;
   },
@@ -149,6 +160,9 @@ function renderShell() {
     state.epoch += 1;
     state.polling = false;
     state.updated = null;
+    state.failure = null;
+    clearTimeout(state.expiry);
+    state.expiry = null;
     state.data = emptyData();
     state.filters = {};
     state.histories.clear();
@@ -165,26 +179,31 @@ function renderShell() {
   renderContent();
 }
 
-function renderHeader() {
-  shell.querySelector('#hcc-pages').innerHTML = Object.entries(pages).map(([key, names]) =>
+function renderHeader(preserveNavigation = false) {
+  if (!preserveNavigation) shell.querySelector('#hcc-pages').innerHTML = Object.entries(pages).map(([key, names]) =>
     `<button type="button" class="hcc-nav-item" data-page="${key}" aria-label="${t(names[0], names[1])}" title="${t(names[0], names[1])}" aria-current="${key === state.view ? 'page' : 'false'}">${icon(key, 17)}<span>${t(names[0], names[1])}</span></button>`
   ).join('');
   const mode = shell.querySelector('#hcc-mode');
-  const available = state.data.sources.filter(source => ['available', 'partial'].includes(source.status)).length;
+  const sources = state.failure?.sources || state.data.sources;
+  const stale = state.failure && state.data.access;
+  const available = !state.failure && sources.some(source => ['available', 'partial'].includes(source.status));
   const syncStatus = state.demo ? t('Demo data', 'Демоданные')
-    : !state.updated ? t('Connecting', 'Подключение')
+    : stale ? t('Showing last received data', 'Показаны последние полученные данные')
+    : !state.updated && !state.failure ? t('Connecting', 'Подключение')
     : !available ? t('Sources unavailable', 'Источники недоступны')
-    : state.data.sources.some(source => source.status !== 'available') ? t('Sources partly available', 'Часть источников доступна')
+    : sources.some(source => source.status !== 'available') ? t('Sources partly available', 'Часть источников доступна')
     : t('Sources connected', 'Источники подключены');
+  const syncTime = state.updated ? `${state.failure ? t('Last successful update', 'Последнее успешное обновление') : t('Synced', 'Обновлено')} ${esc(ctx.rel(state.updated))}`
+    : state.failure ? t('Waiting for the next attempt', 'Ожидание следующей попытки') : t('Checking availability', 'Проверка доступности');
   mode.classList.toggle('is-demo', state.demo);
   mode.innerHTML = `<i></i>${state.demo ? 'DEMO' : 'LIVE'}${icon('chevron', 13)}`;
   mode.title = state.demo ? t('Switch to live sources', 'Переключиться на рабочие источники') : t('Switch to demo data', 'Переключиться на демоданные');
   const names = pages[state.view];
   shell.querySelector('#hcc-pagehead').innerHTML = `<div><h1>${t(names[0], names[1])}</h1><p>${t(names[2], names[3])}</p></div>
-    <div class="hcc-sync"><span class="hcc-sync-dot ${available ? 'is-ready' : ''}"></span><div><strong>${syncStatus}</strong><small>${state.updated ? `${t('Synced', 'Обновлено')} ${esc(ctx.rel(state.updated))}` : t('Checking availability', 'Проверка доступности')}</small></div></div>`;
+    <div class="hcc-sync${state.failure ? ' is-interrupted' : ''}"><span class="hcc-sync-dot ${stale ? 'is-stale' : available ? 'is-ready' : ''}"></span><div><strong>${syncStatus}</strong><small>${syncTime}</small></div></div>`;
   shell.querySelector('#hcc-nav-foot').innerHTML = `<button class="hcc-source-link" type="button" data-sources aria-label="${t('Data sources', 'Источники данных')}">${icon('terminal', 16)}<span>${t('Data sources', 'Источники данных')}</span>${icon('chevron', 13)}</button>`;
-  shell.querySelector('[data-sources]').onclick = () => detail(t('Data sources', 'Источники данных'), state.data.sources.length
-    ? state.data.sources.map(source => `<section class="hcc-source-row"><div><strong>${esc(source.label)}</strong><p>${esc(t(source.detail, source.detailRu || source.detail))}</p>
+  shell.querySelector('[data-sources]').onclick = () => detail(t('Data sources', 'Источники данных'), sources.length
+    ? sources.map(source => `<section class="hcc-source-row"><div><strong>${esc(source.label)}</strong><p>${esc(t(source.detail, source.detailRu || source.detail))}</p>
       ${source.lastSuccessAt ? `<p>${t('Last successful collection','Последний успешный сбор')} · ${esc(ctx.rel(source.lastSuccessAt))}</p>` : ''}
       ${source.missing?.length ? `<p>${t('Missing','Нет данных')} · ${esc(source.missing.join(', '))}</p>` : ''}
       ${source.limits?.length ? `<ul>${source.limits.map(limit => `<li>${esc(limit)}</li>`).join('')}</ul>` : ''}
@@ -210,7 +229,34 @@ function renderContent(preserveScroll = false) {
   if (chromeFocus) document.getElementById(chromeFocus)?.focus({ preventScroll: true });
 }
 
+function discardCachedLive() {
+  clearTimeout(state.expiry);
+  state.expiry = null;
+  state.data = state.failure;
+  state.epoch += 1;
+  state.polling = false;
+  state.filters = {};
+  state.histories.clear();
+  state.pending = false;
+  returnFocus = null;
+  if (inspector.open) inspector.close();
+  inspector.replaceChildren();
+  renderHeader();
+  renderContent(true);
+}
+
+function handleAccessDenial(error, epoch) {
+  if (state.closed || state.demo || state.epoch !== epoch || !state.data.access || !isAccessDenied(error)) return;
+  state.failure = {...emptyData(), sources: [sidecarError(error)]};
+  discardCachedLive();
+}
+
+function expireCachedLive() {
+  if (state.failure && state.data.access && Date.now() - state.updated >= STALE_WINDOW) discardCachedLive();
+}
+
 async function poll(force = false) {
+  expireCachedLive();
   if (state.closed || state.polling || (!force && document.hidden)) return;
   const epoch = state.epoch;
   state.polling = true;
@@ -227,22 +273,31 @@ async function poll(force = false) {
     next = { ...emptyData(), sources: [{ id: 'webui', label: 'Hermes WebUI', status: 'unavailable' }] };
   }
   if (epoch !== state.epoch || state.closed) return;
-  const lostAccess = !state.demo && state.data.access && !next.access;
-  state.data = next;
   state.polling = false;
-  state.updated = Date.now();
-  if (lostAccess) {
-    state.epoch += 1;
-    state.histories.clear();
-    state.pending = false;
-    if (inspector.open) inspector.close();
-    inspector.replaceChildren();
-    renderHeader();
-    renderContent();
-    return;
+  if (state.demo || next.access) {
+    clearTimeout(state.expiry);
+    state.expiry = null;
+    state.failure = null;
+    state.data = next;
+    state.updated = Date.now();
+  } else {
+    const firstFailure = !state.failure;
+    state.failure = next;
+    if (firstFailure && next.retryable) setTimeout(() => {
+      if (state.failure === next) poll();
+    }, RETRY_DELAY);
+    if (state.data.access) {
+      const remaining = STALE_WINDOW - (Date.now() - state.updated);
+      if (!next.retryable || remaining <= 0) {
+        discardCachedLive();
+        return;
+      }
+      state.expiry ??= setTimeout(expireCachedLive, remaining);
+    } else {
+      state.data = next;
+    }
   }
-  if (!shell.contains(shell.querySelector('#hcc-pages')?.querySelector(':focus'))) renderHeader();
-  else shell.querySelector('#hcc-refresh')?.classList.remove('is-spinning');
+  renderHeader(Boolean(shell.querySelector('#hcc-pages :focus')));
   if (['usage', 'infrastructure'].includes(state.view)) loadHistory(currentRange());
   if (!canRenderRefresh()) {
     state.pending = true;
@@ -254,6 +309,7 @@ async function poll(force = false) {
 
 inspector.addEventListener('close', () => {
   returnFocus?.focus();
+  returnFocus = null;
   if (state.pending) {
     state.pending = false;
     renderContent(true);

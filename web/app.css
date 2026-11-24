@@ -76,6 +76,7 @@ h1, h2, h3, p { margin: 0; }
 .hcc-sync { display: flex; gap: 9px; align-items: center; flex: none; }
 .hcc-sync-dot { color: var(--dim); box-shadow: 0 0 0 4px color-mix(in srgb,var(--dim) 12%, transparent); }
 .hcc-sync-dot.is-ready { color: var(--green); box-shadow: 0 0 0 4px color-mix(in srgb,var(--green) 15%, transparent); }
+.hcc-sync-dot.is-stale { color: var(--amber); box-shadow: 0 0 0 4px color-mix(in srgb,var(--amber) 15%, transparent); }
 .hcc-sync strong, .hcc-sync small { display: block; }
 .hcc-sync strong { font-size: 11px; font-weight: 650; }
 .hcc-sync small { color: var(--muted); font-size: 10px; }
@@ -241,8 +242,9 @@ h1, h2, h3, p { margin: 0; }
   .hcc-head-tools { gap: 4px; }
   .hcc-head-tools .hcc-divider { display: none; }
   .hcc-layout { height: calc(100% - 53px); }
-  .hcc-sync { display: none; }
-  .hcc-pagehead { padding-block: 16px 13px; }
+  .hcc-sync:not(.is-interrupted) { display: none; }
+  .hcc-sync.is-interrupted { flex: 1 1 100%; }
+  .hcc-pagehead { padding-block: 16px 13px; flex-wrap: wrap; }
   .hcc-pagehead p { font-size: 12px; }
   .hcc-content { padding-inline: 9px; }
   .hcc-graph-layout { grid-template-columns: minmax(0,1fr); gap: 9px; }

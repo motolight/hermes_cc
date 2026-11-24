@@ -321,11 +321,21 @@ function communicationView(ctx, filter) {
     </button>`;
   }).join('');
   const modes = [['communication', ctx.t('Agent messages', 'Сообщения агентов')], ['technical', ctx.t('Technical log', 'Технический журнал')]];
+  const unreadable = !ctx.demo && !ctx.loading && !ctx.data.access;
+  const incomplete = !ctx.demo && !visible.length && list(ctx.data.sources).some(source =>
+    ['hermes', 'pi'].includes(source.id) && source.status !== 'available');
+  const noEvents = unreadable ? empty(ctx, ctx.t('Event stream unavailable', 'Лента событий недоступна'),
+    ctx.t('Waiting for a successful update from WebUI and HCC.', 'Ожидается успешное обновление от WebUI и HCC.'))
+    : incomplete ? empty(ctx, ctx.t('No events in the available records', 'В доступных записях нет событий'),
+      ctx.t('Some Hermes or Pi records could not be collected.', 'Часть записей Hermes или Pi недоступна для сбора.'))
+    : dataEmpty(ctx, visible, ctx.t('No events in this stream', 'Нет событий в этом потоке'),
+      ctx.t('Records appear here when connected sources report them.', 'Записи появятся, когда их передадут подключённые источники.'));
   return `<div class="hv-page"><div class="hv-view-switch">${segment(ctx, 'channel', channel, modes, ctx.t('Event stream', 'Поток событий'))}</div>${toolbar(ctx, filter, ctx.t('Search events and agents…', 'Поиск по событиям и агентам…'), [
     select(ctx, filter, 'kind', ctx.t('Event', 'Событие'), optionsFor(visible, 'kind', (value) => label(ctx, value, kinds))),
     select(ctx, filter, 'agent', ctx.t('Agent', 'Агент'), endpoints),
     select(ctx, filter, 'session', ctx.t('Session', 'Сессия'), optionsFor(visible, 'session')),
-  ])}${panel(ctx, modes.find(([value]) => channel === value)[1], results.length ? `<div class="hv-timeline">${rows}</div>` : dataEmpty(ctx, visible, ctx.t('No events in this stream', 'Нет событий в этом потоке'), ctx.t('Records appear here when connected sources report them.', 'Записи появятся, когда их передадут подключённые источники.')), `${results.length} / ${visible.length}`)}</div>`;
+  ])}${panel(ctx, modes.find(([value]) => channel === value)[1], results.length ? `<div class="hv-timeline">${rows}</div>` : noEvents,
+    unreadable || incomplete ? '' : `${results.length} / ${visible.length}`)}</div>`;
 }
 
 const lanes = [
