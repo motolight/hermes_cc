@@ -1,0 +1,17 @@
+{
+  "id": "hermes-command-center",
+  "name": "Hermes Command Center",
+  "version": "0.1.0",
+  "enabled": true,
+  "scripts": ["web/boot.js"],
+  "permissions": {
+    "storage": { "owned": true },
+    "network_external": false
+  },
+  "sidecar": {
+    "type": "loopback",
+    "origin": "http://127.0.0.1:17882",
+    "health_path": "/health",
+    "proxy_auth": "token-v1"
+  }
+}
