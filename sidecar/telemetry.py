@@ -13,11 +13,14 @@ import sqlite3
 import stat
 import subprocess
 import time
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path, PureWindowsPath
+
+from safe_text import display_text
 
 MAX_PROFILES = 24
 MAX_SESSIONS = 80
@@ -238,28 +241,24 @@ def project_name(root):
     return None
 
 
-def active_sessions(db, sessions):
-    if not sessions:
-        return {}
-    placeholders = ",".join("?" for _ in sessions)
+def active_sessions(db):
     active = {}
     admissions = sqlite_columns(db, "session_admissions")
     if {"target_session_id", "status", "owner_epoch"} <= admissions and "epoch" in sqlite_columns(db, "runtime_epoch"):
+        order = " ORDER BY MAX(seq) DESC" if "seq" in admissions else ""
         for row in db.execute(
             "SELECT target_session_id, MAX(status = 'started') AS running FROM session_admissions "
-            f"WHERE target_session_id IN ({placeholders}) AND (status = 'queued' OR "
-            "(status = 'started' AND owner_epoch = (SELECT epoch FROM runtime_epoch WHERE singleton = 1))) "
-            "GROUP BY target_session_id",
-            sessions,
+            "WHERE status = 'queued' OR "
+            "(status = 'started' AND owner_epoch = (SELECT epoch FROM runtime_epoch WHERE singleton = 1)) "
+            "GROUP BY target_session_id" + order + " LIMIT 160"
         ):
             active[row["target_session_id"]] = "running" if row["running"] else "queued"
     executions = sqlite_columns(db, "worker_executions")
     if {"session_id", "kind", "status", "owner_epoch"} <= executions and "epoch" in sqlite_columns(db, "runtime_epoch"):
         for row in db.execute(
             "SELECT DISTINCT session_id, kind FROM worker_executions "
-            f"WHERE session_id IN ({placeholders}) AND status = 'running' "
-            "AND owner_epoch = (SELECT epoch FROM runtime_epoch WHERE singleton = 1) LIMIT 160",
-            sessions,
+            "WHERE status = 'running' AND owner_epoch = "
+            "(SELECT epoch FROM runtime_epoch WHERE singleton = 1) LIMIT 160",
         ):
             active[row["session_id"]] = "running"
     return active
@@ -275,10 +274,12 @@ def agent(profile, record_id, *, kind, name, role, model=None, status="unknown",
     }
 
 
-def usage_row(row, session, at, model, task=None):
+def usage_row(row, session, at, model, task=None, *, counter_scope="session", counter_key=None, counter_created=None):
     return {
         "at": utc(at), "agent": session["id"], "project": session["project"],
         "model": model, "task": task, "session": session["session"],
+        "counterScope": counter_scope, "counterKey": counter_key,
+        "counterCreatedAt": timestamp(session["startedAt"]) if counter_created is None else counter_created,
         **{field: number(row[column]) for field, column in TOKEN_FIELDS.items()},
         "ttftMs": None, "tokensPerSecond": None, "durationMs": None, "contextTokens": None,
         "errors": None, "retries": None, "orchestration": None,
@@ -288,20 +289,29 @@ def usage_row(row, session, at, model, task=None):
 def session_usage(db, rows, sessions):
     columns = sqlite_columns(db, "session_model_usage")
     per_model = []
+    route_fields = ("billing_provider", "billing_base_url", "billing_mode")
     if sessions and {"session_id", "model", "task", "last_seen", *TOKEN_FIELDS.values()} <= columns:
         placeholders = ",".join("?" for _ in sessions)
         # Per-route records overlap the session counters. Prefer route records
         # when present, including auxiliary calls (which can exist only here).
+        dimensions = [field for field in route_fields if field in columns]
+        selected_dimensions = "".join(f", {field}" for field in dimensions)
+        first_seen = "MIN(first_seen)" if "first_seen" in columns else "NULL"
         per_model = db.execute(
-            "SELECT session_id, substr(model, 1, 121) AS model, substr(task, 1, 81) AS task, MAX(last_seen) AS last_seen, "
+            f"SELECT session_id, substr(model, 1, 121) AS model, substr(task, 1, 81) AS task, "
+            f"MAX(last_seen) AS last_seen, {first_seen} AS created, "
             + ", ".join(f"SUM({column}) AS {column}" for column in TOKEN_FIELDS.values())
+            + selected_dimensions
             + f" FROM session_model_usage WHERE session_id IN ({placeholders}) "
-            "GROUP BY session_id, model, task ORDER BY last_seen DESC LIMIT ?",
+            "GROUP BY session_id, session_model_usage.model, session_model_usage.task" + selected_dimensions
+            + " ORDER BY last_seen DESC LIMIT ?",
             (*sessions, MAX_USAGE + 1),
         ).fetchall()
     usage = [
         usage_row(row, sessions[row["session_id"]], row["last_seen"],
-                  model_name(row["model"]), label(row["task"]))
+                  model_name(row["model"]), label(row["task"]), counter_scope="route",
+                  counter_created=timestamp(row["created"]), counter_key=hashlib.sha256(json.dumps([row["model"], row["task"],
+                                                        *(row[k] for k in dimensions)]).encode()).hexdigest())
         for row in per_model[:MAX_USAGE]
     ]
     covered = {row["session_id"] for row in per_model}
@@ -325,7 +335,7 @@ def session_usage(db, rows, sessions):
                 entry = usage_row(row, session, row["last_activity_at"] or row["ended_at"] or row["started_at"],
                                   session["model"])
                 # Zero-initialized counters alone do not establish observed traffic.
-                if any(entry[field] for field in TOKEN_FIELDS):
+                if any(entry[field] for field in TOKEN_FIELDS) or (session["active"] and any(entry[field] is not None for field in TOKEN_FIELDS)):
                     usage.append(entry)
     return usage, partial
 
@@ -340,9 +350,23 @@ def run_state(value):
     }.get(value, "unknown")
 
 
+def current_linux_owner(pid, start):
+    if type(pid) is not int or type(start) is not int or pid <= 0 or start <= 0 or not hasattr(os, "geteuid"):
+        return False
+    path = Path("/proc") / str(pid) / "stat"
+    try:
+        if path.stat().st_uid != os.geteuid():
+            return False
+        fields = bounded_read(path, 8192).rpartition(b")")[2].split()
+        return fields[0] not in {b"Z", b"X"} and int(fields[19]) == start
+    except (OSError, IndexError, ValueError):
+        return False
+
+
 def event_for(node, kind, from_id=None):
     return {
         "id": node["id"] + ":" + kind, "at": node["updatedAt"] or node["startedAt"],
+        "channel": "technical",
         "kind": kind, "from": from_id, "to": node["id"],
         "title": node["name"], "detail": node["status"], "project": node["project"],
         "team": node["team"], "session": node["session"],
@@ -374,6 +398,9 @@ def message_events(db, sessions, deadline):
             outgoing = row["role"] == "assistant"
             is_tool = row["role"] == "tool"
             tool = label(row["tool_name"]) if is_tool else None
+            if "lastAction" not in node:
+                node["lastAction"] = f"Tool result · {tool}" if tool else title[row["role"]]
+                node["lastActivityAt"] = at
             events.append({
                 **event_for(node, "tool" if is_tool else "message"),
                 "id": f"{node['id']}:message:{row['id']}", "at": at,
@@ -419,7 +446,8 @@ def delegation_state(db, sessions, profile):
                     )
                 }
         rows = sqlite_select(
-            db, table, (identity, "state", started, "updated_at", *parents), columns,
+            db, table, (identity, "state", started, "updated_at", "completed_at", "origin_ui_session_id",
+                        "owner_pid", "owner_started_at", *parents), columns,
             "ORDER BY updated_at DESC LIMIT ?", (MAX_DELEGATIONS + 1,),
         )
         clipped |= len(rows) > MAX_DELEGATIONS
@@ -427,7 +455,7 @@ def delegation_state(db, sessions, profile):
             record_id = label(row[identity])
             if not record_id:
                 continue
-            parent = next((sessions[row[key]] for key in parents if row[key] in sessions), None)
+            parent = next((sessions[row[key]] for key in (*parents, "origin_ui_session_id") if row[key] in sessions), None)
             child_id, unit_id = json_fields.get(record_id, (None, None))
             child = sessions.get(child_id)
             parent = parent or delegations.get(unit_id)
@@ -440,6 +468,16 @@ def delegation_state(db, sessions, profile):
                 session=bound_session, started_at=row[started],
                 updated_at=row["updated_at"], detail="Persisted Hermes run state",
             )
+            active_status = node["status"] in {"running", "queued", "stalled"}
+            updated_at = timestamp(row["updated_at"])
+            recent = updated_at is not None and 0 <= time.time() - updated_at <= 120
+            node["active"] = active_status and row["completed_at"] is None and bool(
+                (child and child.get("active")) or current_linux_owner(row["owner_pid"], row["owner_started_at"])
+                or (recent and parent and parent.get("active")))
+            if active_status and not node["active"]:
+                node["reportedStatus"] = node["status"]
+                node["status"] = "unknown"
+                node["detail"] = "The durable record has a nonterminal state without current owner activity."
             nodes.append(node)
             if kind == "delegation":
                 delegations[record_id] = node
@@ -447,8 +485,46 @@ def delegation_state(db, sessions, profile):
                 links.append({"from": parent["id"], "to": node["id"], "kind": "delegation"})
             if child:
                 links.append({"from": node["id"], "to": child["id"], "kind": "execution"})
-            events.append(event_for(node, kind, parent["id"] if parent else None))
+            task_data = {}
+            if kind == "delegation" and {"task_json", "result_json"} & columns:
+                fields = [f"CASE WHEN length({field}) <= 65536 THEN {field} END AS {field}" if field in columns else f"NULL AS {field}"
+                          for field in ("task_json", "result_json")]
+                native = db.execute(f"SELECT {', '.join(fields)} FROM async_delegations WHERE delegation_id = ?", (record_id,)).fetchone()
+                if native:
+                    task_data = {field: parse_object(native[field]) for field in ("task_json", "result_json")}
+            goal = display_text(task_data.get("task_json", {}).get("goal"))
+            result = task_data.get("result_json", {})
+            if goal:
+                node["task"] = display_text(goal, 180, single_line=True)
+            event = event_for(node, kind, parent["id"] if parent else None)
+            if kind == "delegation" and (parent or goal):
+                event.update(id=node["id"] + ":delegated", at=node["startedAt"], channel="communication",
+                             title="Hermes delegation", body=goal, thread=node["id"])
+            events.append(event)
+            if kind == "delegation" and result:
+                failure = display_text(result.get("error"))
+                summary = display_text(result.get("summary"))
+                if summary or failure:
+                    events.append({
+                        **event, "id": node["id"] + ":result", "at": utc(row["completed_at"]) or node["updatedAt"],
+                        "from": node["id"], "to": parent["id"] if parent else None,
+                        "channel": "communication", "kind": "error" if failure else "result", "thread": node["id"],
+                        "title": "Hermes delegation failed" if failure else "Hermes delegation result",
+                        "body": failure or summary, "reason": failure,
+                    })
+                    node["lastAction"] = "Reported an error" if failure else "Returned a result"
+                if failure and node["status"] in {"failed", "stalled", "interrupted"}:
+                    node["issue"] = {"reason": failure, "at": utc(row["completed_at"]) or node["updatedAt"],
+                                     "lastActivityAt": node["updatedAt"]}
     return nodes, links, events, clipped
+
+
+def parse_object(value):
+    try:
+        obj = json.loads(value) if value else {}
+    except (ValueError, TypeError):
+        return {}
+    return obj if isinstance(obj, dict) else {}
 
 
 def read_profile(path, profile, deadline):
@@ -470,8 +546,20 @@ def read_profile(path, profile, deadline):
         )
         clipped = len(rows) > MAX_SESSIONS
         rows = [row for row in rows[:MAX_SESSIONS] if label(row["id"])]
-        active = active_sessions(db, [row["id"] for row in rows])
+        active = active_sessions(db)
+        known = {row["id"] for row in rows}
+        extra = [sid for sid in active if sid not in known and label(sid)]
+        if extra:
+            placeholders = ",".join("?" for _ in extra)
+            condition = " AND COALESCE(hidden, 0) = 0" if "hidden" in columns else ""
+            rows.extend(sqlite_select(db, "sessions", fields, columns, f"WHERE id IN ({placeholders})" + condition, extra))
         nodes, links, events, sessions = [], [], [], {}
+        titles = {}
+        if "title" in columns and rows:
+            ids = [row["id"] for row in rows]
+            placeholders = ",".join("?" for _ in ids)
+            titles = {row["id"]: display_text(row["title"], 180, single_line=True) for row in db.execute(
+                f"SELECT id, CASE WHEN length(title)<=4096 THEN title END AS title FROM sessions WHERE id IN ({placeholders})", ids)}
         for row in rows:
             channel = SESSION_SOURCES.get(row["source"], "Hermes session")
             kind = "worker" if row["source"] in {"delegate", "child", "kanban", "cron"} else "session"
@@ -483,6 +571,8 @@ def read_profile(path, profile, deadline):
                 updated_at=row["last_activity_at"] or row["ended_at"] or row["started_at"],
                 detail="Persisted Hermes session metadata",
             )
+            node["task"] = titles.get(row["id"])
+            node["active"] = row["id"] in active
             sessions[row["id"]] = node
             nodes.append(node)
         for row in rows:
@@ -496,23 +586,39 @@ def read_profile(path, profile, deadline):
                 events.append(event_for(node, "session"))
         usage, usage_clipped = session_usage(db, rows, sessions)
         runs, run_links, run_events, runs_clipped = delegation_state(db, sessions, profile)
-        messages, messages_clipped = message_events(db, sessions, deadline)
+        active_first = dict(sorted(sessions.items(), key=lambda item: not item[1]["active"]))
+        messages, messages_clipped = message_events(db, active_first, deadline)
     missing_counters = not set(TOKEN_FIELDS.values()) <= columns
+    limits = []
+    if clipped:
+        limits.append(f"{MAX_SESSIONS} historical sessions per profile; current owner records are checked separately.")
+    if runs_clipped:
+        limits.append(f"{MAX_DELEGATIONS} recent delegation records per native table.")
+    if messages_clipped:
+        limits.append("The read deadline curtailed technical message metadata.")
+    if usage_clipped:
+        limits.append("Usage routes are limited or overlap an older cumulative session count.")
+    if missing_counters:
+        limits.append("This profile schema does not expose all native token counters.")
     return (
         nodes + runs, links + run_links, events + run_events + messages, usage,
-        clipped or usage_clipped or runs_clipped or messages_clipped or missing_counters,
+        limits,
     )
 
 
 def collect_hermes(home):
     nodes, links, events, usage = [], [], [], []
-    paths, partial = profile_databases(home)
+    paths, limited_profiles = profile_databases(home)
+    limits = set()
+    if limited_profiles:
+        limits.add(f"Profile discovery was limited to {MAX_PROFILES} stores or the profile directory could not be read.")
     available, unavailable = 0, 0
+    failures = Counter()
     seen = set()
     deadline = time.monotonic() + DB_TIME_LIMIT
     for profile, path in paths:
         if time.monotonic() >= deadline:
-            partial = True
+            limits.add(f"The {DB_TIME_LIMIT:g}s cycle deadline curtailed profile reads.")
             break
         try:
             info = path.lstat()
@@ -520,27 +626,40 @@ def collect_hermes(home):
             if info.st_ino and identity in seen:
                 continue
             values = read_profile(path, profile, deadline)
-        except (OSError, ValueError, sqlite3.Error):
+        except (OSError, ValueError, sqlite3.Error) as error:
             unavailable += 1
+            if isinstance(error, FileNotFoundError):
+                reason = "Native state.db or existing WAL bookkeeping is missing"
+            elif isinstance(error, PermissionError):
+                reason = "Access to the native state files was denied"
+            elif isinstance(error, sqlite3.Error):
+                reason = "SQLite timed out, was busy or could not read the expected schema"
+            else:
+                reason = "The store changed while reading or uses an unsupported format"
+            failures[reason] += 1
             continue
         if info.st_ino:
             seen.add(identity)
         available += 1
-        partial |= values[4]
+        limits.update(values[4])
         nodes.extend(values[0])
         links.extend(values[1])
         events.extend(values[2])
         usage.extend(values[3])
     if available == 0:
         status, detail = "unavailable", "No readable Hermes profile state."
-    elif unavailable or partial:
+    elif unavailable or limits:
         status, detail = (
             "partial",
-            f"{available} profile stores read. Some records are unavailable, exceed limits, or lack reliable usage attribution.",
+            f"{available} profile stores read. {unavailable} stores could not be read.",
         )
     else:
         status, detail = "available", f"{available} profile stores read. Usage is cumulative per session or model."
-    return nodes, links, events, usage, source("hermes", "Hermes profile state", status, detail)
+    info = source("hermes", "Hermes profile state", status, detail)
+    info.update(limits=sorted(limits), missing=[f"{count} · {reason}" for reason,count in sorted(failures.items())],
+                impact="Historical runs and token coverage may be incomplete." if unavailable or limits else None,
+                recommendation="Inspect the profile store and check filesystem read permissions." if unavailable else None)
+    return nodes, links, events, usage, info
 
 
 GPU_QUERY = (

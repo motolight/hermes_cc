@@ -43,14 +43,23 @@ export const timestamp = value => {
 };
 
 const palettes = ['blue', 'violet', 'green', 'amber'];
-export function color(agent) {
-  if (palettes.includes(agent.color)) return agent.color;
-  let hash = 0;
-  for (const char of (agent.id || agent.name || '')) hash = ((hash << 5) - hash + char.charCodeAt(0)) | 0;
-  return palettes[Math.abs(hash) % palettes.length];
+function avatarHash(agent) {
+  const identity = agent.kind === 'profile' ? agent.profile || agent.id : agent.id || agent.name;
+  let hash = 2166136261;
+  for (const char of identity || '') hash = Math.imul(hash ^ char.codePointAt(0), 16777619);
+  return hash >>> 0;
 }
 
-export const avatar = (agent, size = 34) => `<span class="hcc-avatar avatar-${color(agent)}" style="--avatar-size:${Number(size) || 34}px" aria-hidden="true"><span></span></span>`;
+export function color(agent) {
+  return palettes.includes(agent.color) ? agent.color : palettes[avatarHash(agent) % palettes.length];
+}
+
+export function avatar(agent, size = 34) {
+  const variant = color(agent);
+  const native = {blue: 216, violet: 261, green: 157, amber: 34};
+  const hue = palettes.includes(agent.color) ? native[variant] : avatarHash(agent) % 360;
+  return `<span class="hcc-avatar avatar-${variant}" style="--avatar-size:${Number(size) || 34}px;--avatar:hsl(${hue} 84% 71%);--avatar-turn:${hue-native[variant]}deg" aria-hidden="true"><span></span></span>`;
+}
 
 const labels = {
   working: ['Working', 'В работе'], running: ['Running', 'В работе'], active: ['Active', 'Активен'],

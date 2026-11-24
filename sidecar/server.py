@@ -16,8 +16,12 @@ from http import HTTPStatus
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
-from kanban import collect_kanban
+from history import BackgroundCollector, HistoryStore, RANGES
+from kanban import collect_kanban, read_kanban_task
+from pi_integration import collect_pi_bridge
+from topology import classify
 from telemetry import (
     DB_TIME_LIMIT, MetricsOrigin, bounded_read, collect_gpu, collect_hermes, collect_metrics,
     collect_pi, collect_systemd, parse_metrics_origin, source, utc,
@@ -26,6 +30,7 @@ from telemetry import (
 HOST = "127.0.0.1"
 PORT = 17882
 SNAPSHOT_TTL = 5.0
+BACKGROUND_INTERVAL = 30.0
 HISTORY_SAMPLES = 120
 MAX_THREADS = 12
 MAX_OUTPUT_AGENTS = 480
@@ -44,6 +49,9 @@ class Config:
     vllm_origin: MetricsOrigin | None
     systemd_scope: str
     gpu_ssh_user: str | None = None
+    history_dir: Path | None = None
+    pi_bridge_home: Path | None = None
+    pi_sessions: Path | None = None
 
     @classmethod
     def from_environment(cls):
@@ -57,7 +65,10 @@ class Config:
             origin = "http://127.0.0.1:" + os.getenv("HCC_VLLM_PORT", "8000")
         scope = os.getenv("HCC_SYSTEMD_SCOPE", "both")
         return cls(token, hermes_home, webui_state, parse_metrics_origin(origin),
-                   scope if scope in {"user", "system", "both"} else "both", os.getenv("HCC_GPU_SSH_USER"))
+                   scope if scope in {"user", "system", "both"} else "both", os.getenv("HCC_GPU_SSH_USER"),
+                   webui_state / ".hermes-command-center" / "telemetry",
+                   Path(os.getenv("PI_BRIDGE_HOME") or Path.home() / ".local/state/pi-bridge").expanduser(),
+                   Path(os.getenv("PI_CODING_AGENT_DIR") or Path.home() / ".pi/agent").expanduser() / "sessions")
 
 
 def collected(function, fallback):
@@ -80,11 +91,12 @@ def encode_snapshot(snapshot):
     if len(body) <= MAX_SNAPSHOT_BYTES:
         return body
 
-    pi_ids = {node["id"] for node in snapshot["agents"] if node["role"] == "Pi Bridge"}
+    pi_ids = {node["id"] for node in snapshot["agents"] if node.get("role") == "Pi Bridge" or node.get("kind") == "pi"}
     pi_events = [event for event in snapshot["events"] if event["from"] in pi_ids or event["to"] in pi_ids]
     hermes_events = [event for event in snapshot["events"] if event["from"] not in pi_ids and event["to"] not in pi_ids]
     pi_nodes = [node for node in snapshot["agents"] if node["id"] in pi_ids]
-    hermes_nodes = [node for node in snapshot["agents"] if node["id"] not in pi_ids]
+    profiles = [node for node in snapshot["agents"] if node.get("kind") == "profile"]
+    hermes_nodes = [node for node in snapshot["agents"] if node["id"] not in pi_ids and node.get("kind") != "profile"]
 
     def limited_body(share):
         affected = set()
@@ -97,18 +109,20 @@ def encode_snapshot(snapshot):
 
         # Give each source a share of the byte budget. Keep live gauges,
         # services and source states in every response.
-        agents = retain(pi_nodes, "pi") + retain(hermes_nodes, "hermes")
+        agents = profiles + retain(pi_nodes, "pi") + retain(hermes_nodes, "hermes")
         ids = {node["id"] for node in agents}
         events = sorted(retain(pi_events, "pi") + retain(hermes_events, "hermes"),
                         key=lambda event: event["at"] or "", reverse=True)
         clipped = {
             **snapshot,
             "agents": agents,
+            "runs": retain(snapshot.get("runs", []), "hermes"),
+            "issues": retain(snapshot.get("issues", []), "hermes"),
             "events": events,
             "links": [edge for edge in snapshot["links"] if edge["from"] in ids and edge["to"] in ids],
             "tasks": retain(snapshot["tasks"], "kanban"),
             "usage": retain(snapshot["usage"], "hermes"),
-            "gpus": [{**gpu, "history": retain(gpu["history"], "gpu", newest_last=True)} for gpu in snapshot["gpus"]],
+            "gpus": [{**gpu, "history": retain(gpu.get("history", []), "gpu", newest_last=True)} for gpu in snapshot["gpus"]],
         }
         clipped["sources"] = [
             {**entry, "status": "partial", "detail": entry["detail"] + " Older records were limited by the proxy size budget."}
@@ -142,6 +156,14 @@ class Snapshot:
         self.body = b""
         self.gpu_history = {}
         self.counters = {}
+        self.source_success = {}
+        self.history = None
+        self.history_error = False
+        if config.history_dir is not None:
+            try:
+                self.history = HistoryStore(config.history_dir)
+            except (OSError, ValueError, sqlite3.Error):
+                self.history_error = True
 
     def close(self):
         self.pool.shutdown(wait=True)
@@ -150,7 +172,30 @@ class Snapshot:
         # A single refresh populates the cache for simultaneous requests.
         with self.refresh_lock:
             if time.monotonic() >= self.expires:
-                self.body = encode_snapshot(self.refresh())
+                snapshot = self.refresh()
+                if self.history is not None:
+                    try:
+                        self.history.record(time.time(), snapshot["usage"], snapshot["gpus"], snapshot["metrics"])
+                        self.history_error = False
+                    except (OSError, ValueError, sqlite3.Error):
+                        self.history_error = True
+                if self.config.history_dir is not None:
+                    status = "unavailable" if self.history_error or self.history is None else "available"
+                    snapshot["sources"].append({
+                        **source("history", "HCC telemetry history", status,
+                                 "Persistent collection is active." if status == "available" else "The private telemetry store could not be written."),
+                        "lastSuccessAt": snapshot["at"] if status == "available" else self.source_success.get("history"),
+                        "missing": [] if status == "available" else ["New observed deltas and historical engine/GPU samples"],
+                        "limits": ["31 days", "64 MiB"],
+                        "recommendation": None if status == "available" else "Inspect the HCC telemetry directory and the sidecar write exception.",
+                    })
+                    if status == "available":
+                        self.source_success["history"] = snapshot["at"]
+                snapshot["usage"] = [
+                    {key: value for key, value in row.items() if key not in {"counterKey", "counterCreatedAt"}}
+                    for row in snapshot["usage"] if any(row.get(key) for key in ("input", "output", "cached", "reasoning", "requests"))
+                ]
+                self.body = encode_snapshot(snapshot)
                 self.expires = time.monotonic() + SNAPSHOT_TTL
             return self.body
 
@@ -175,7 +220,7 @@ class Snapshot:
             return None
         previous, at = previous_sample
         elapsed = now - at
-        if (0 < elapsed <= SNAPSHOT_TTL * 6 and previous.keys() == current.keys()
+        if (0 < elapsed <= BACKGROUND_INTERVAL * 2 and previous.keys() == current.keys()
                 and all(current[key] >= previous[key] for key in current)):
             return sum(current[key] - previous[key] for key in current), elapsed
         return None
@@ -184,7 +229,9 @@ class Snapshot:
         data = {key: None for key in ("running", "waiting", "kvCache", "throughput", "ttftMs")}
         if metrics is None:
             self.counters.clear()
-            return data, source("vllm", "vLLM", "unavailable", "Metrics endpoint is unavailable.")
+            return data, {**source("vllm", "vLLM", "unavailable", "The configured Prometheus endpoint could not be read."),
+                          "missing": list(data),
+                          "recommendation": "Verify the configured vLLM origin and that its read-only /metrics endpoint is reachable."}
         now = time.monotonic()
         generation = self.metric_counter_delta("generation", metrics.get("generation"), now)
         if generation:
@@ -205,7 +252,13 @@ class Snapshot:
         state = "available" if present == len(data) else "partial" if recognized else "unavailable"
         detail = ("Throughput and first-token latency summarize activity between consecutive metric scrapes."
                   if recognized else "No recognized metrics were reported.")
-        return data, source("vllm", "vLLM", state, detail)
+        info = source("vllm", "vLLM", state, detail)
+        info.update(missing=[key for key, value in data.items() if value is None],
+                    limits=["Counter resets or a missing interval leave throughput unavailable.",
+                            "For TTFT an interval needs at least one newly observed histogram sample.",
+                            "Prometheus exposes engine aggregates without request or session identifiers."],
+                    impact="Throughput and TTFT describe an engine interval. Per-active-request attribution is unavailable.")
+        return data, info
 
     def refresh(self):
         config = self.config
@@ -226,18 +279,27 @@ class Snapshot:
             collected, partial(collect_systemd, config.systemd_scope),
             ([], source("systemd", "Local services", "unavailable", "Systemd status could not be read.")),
         )
-        pi = self.pool.submit(
-            collected, partial(collect_pi, config.webui_state),
-            ([], [], [], source("pi", "Pi Bridge and Lamp", "unavailable", "Pi status could not be read.")),
-        )
+        pi_unavailable = source("pi", "Pi Bridge and Open Agents", "unavailable", "Pi source files could not be read.")
+        pi = None if config.pi_bridge_home is not None and config.pi_sessions is not None else self.pool.submit(
+            collected, partial(collect_pi, config.webui_state), ([], [], [], pi_unavailable))
         vllm = self.pool.submit(collected, partial(collect_metrics, config.vllm_origin), None) if config.vllm_origin else None
         agents, links, events, usage, hermes_source = hermes.result()
+        if pi is None:
+            native_pi = self.pool.submit(
+                collected, partial(collect_pi_bridge, config.webui_state, config.pi_bridge_home, config.pi_sessions, agents),
+                ([], [], [], [], pi_unavailable),
+            )
         tasks, kanban_source = kanban.result()
-        pi_agents, pi_events, pi_services, pi_source = pi.result()
         gpus, gpu_source = gpu.result()
         services, systemd_source = systemd.result()
         metrics, vllm_source = self.observed_metrics(vllm.result() if vllm else None)
-        now = utc(time.time())
+        if pi is None:
+            pi_agents, pi_links, pi_events, pi_services, pi_source = native_pi.result()
+            links.extend(pi_links)
+        else:
+            pi_agents, pi_events, pi_services, pi_source = pi.result()
+        epoch = time.time()
+        now = utc(epoch)
         self.with_gpu_history(gpus, now)
         # Keep most recent Hermes records bounded across all profiles. Pi nodes
         # are already bounded and form their own independent source.
@@ -247,17 +309,35 @@ class Snapshot:
         if len(agents) > MAX_OUTPUT_AGENTS or len(events) > MAX_OUTPUT_EVENTS or len(usage) > MAX_OUTPUT_USAGE:
             hermes_source["status"] = "partial"
             hermes_source["detail"] = "Recent records shown. Some profile data is unavailable or exceeds collection limits."
-        agents = pi_agents + agents[:MAX_OUTPUT_AGENTS]
-        ids = {entry["id"] for entry in agents}
-        links = [edge for edge in links if edge["from"] in ids and edge["to"] in ids]
-        events = sorted(pi_events + events[:MAX_OUTPUT_EVENTS], key=lambda entry: entry["at"] or "", reverse=True)
+        events = pi_events + events
+        communications = sorted([item for item in events if item.get("channel") == "communication"], key=lambda item: item["at"] or "", reverse=True)
+        technical = sorted([item for item in events if item.get("channel") != "communication"], key=lambda item: item["at"] or "", reverse=True)
+        agents, runs, issues, links = classify(pi_agents + agents, links, communications + technical, tasks, epoch)
         # Usage retains its session ID for accounting when its graph node is
         # outside the visible agent/event window.
+        sources = [hermes_source, kanban_source, pi_source, gpu_source, vllm_source, systemd_source]
+        for entry in sources:
+            if entry["status"] in {"available", "partial"}:
+                self.source_success[entry["id"]] = now
+            entry.setdefault("lastSuccessAt", self.source_success.get(entry["id"]))
+            if entry["status"] != "available":
+                if entry["id"] == "gpu":
+                    entry.setdefault("missing", ["Some or all per-device utilization, VRAM, temperature and power"])
+                    entry.setdefault("recommendation", "Verify nvidia-smi and, for a remote host, the existing SSH key and known_hosts.")
+                elif entry["id"] == "systemd":
+                    entry.setdefault("missing", ["System or user service state for unreported units"])
+                    entry.setdefault("recommendation", "Verify the sidecar user can read service state through systemctl.")
+                elif entry["id"] == "kanban":
+                    entry.setdefault("missing", ["Some boards, cards or run records from native SQLite"])
+                    entry.setdefault("limits", ["Board and per-snapshot task caps apply; each rich detail has its own section limits."])
+                    entry.setdefault("recommendation", "Check the native board store if expected tasks are missing.")
+                entry.setdefault("impact", "Sections that rely on this source may be incomplete.")
         return {
-            "at": now, "agents": agents, "links": links, "events": events[:MAX_OUTPUT_EVENTS],
+            "at": now, "agents": agents, "runs": runs[:MAX_OUTPUT_AGENTS], "issues": issues[:40],
+            "links": links, "events": (communications + technical)[:MAX_OUTPUT_EVENTS],
             "tasks": tasks, "usage": usage[:MAX_OUTPUT_USAGE], "gpus": gpus,
             "services": services + pi_services, "metrics": metrics,
-            "sources": [hermes_source, kanban_source, pi_source, gpu_source, vllm_source, systemd_source],
+            "sources": sources,
         }
 
 
@@ -268,8 +348,12 @@ class Server(ThreadingHTTPServer):
     def __init__(self, address, config):
         self.config = config
         self.snapshot = Snapshot(config)
+        self.background = None
         self.slots = threading.BoundedSemaphore(MAX_THREADS)
         super().__init__(address, Handler)
+        if config.history_dir is not None:
+            self.background = BackgroundCollector(self.snapshot.load, interval=BACKGROUND_INTERVAL)
+            self.background.start()
 
     def get_request(self):
         request, address = super().get_request()
@@ -298,6 +382,8 @@ class Server(ThreadingHTTPServer):
 
     def server_close(self):
         super().server_close()
+        if self.background is not None:
+            self.background.close()
         self.snapshot.close()
 
 
@@ -344,7 +430,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.reply(HTTPStatus.OK, json_body({"status": "ok", "runtime": {"sidecar": "hermes-command-center"},
                                                 "pid": os.getpid()}))
-        elif self.path != "/snapshot":
+        elif not (self.path == "/snapshot" or self.path.startswith(("/history/", "/kanban/task?"))):
             self.reply(HTTPStatus.NOT_FOUND, b'{"error":"not_found"}')
         else:
             auth = self.authorization()
@@ -354,11 +440,40 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(auth, b'{"error":"unauthorized"}')
             else:
                 try:
-                    body = self.server.snapshot.load()
+                    status, body = self.read_data()
                 except SnapshotTooLarge:
                     self.reply(HTTPStatus.SERVICE_UNAVAILABLE, b'{"error":"snapshot_exceeds_size_budget"}')
+                except (OSError, ValueError, sqlite3.Error):
+                    self.reply(HTTPStatus.SERVICE_UNAVAILABLE, b'{"error":"source_unavailable"}')
                 else:
-                    self.reply(HTTPStatus.OK, body)
+                    self.reply(status, body)
+
+    def read_data(self):
+        if self.path == "/snapshot":
+            return HTTPStatus.OK, self.server.snapshot.load()
+        if self.path.startswith("/history/"):
+            selected = self.path.removeprefix("/history/")
+            if selected not in RANGES:
+                return HTTPStatus.NOT_FOUND, b'{"error":"not_found"}'
+            history = self.server.snapshot.history
+            if history is None:
+                return HTTPStatus.SERVICE_UNAVAILABLE, b'{"error":"history_unavailable"}'
+            result = history.read(selected)
+        else:
+            if len(self.path) > 512:
+                return HTTPStatus.BAD_REQUEST, b'{"error":"invalid_task_id"}'
+            try:
+                query = parse_qs(urlsplit(self.path).query, strict_parsing=True, max_num_fields=1, errors="strict")
+                (key,) = query["id"]
+            except (KeyError, ValueError):
+                return HTTPStatus.BAD_REQUEST, b'{"error":"invalid_task_id"}'
+            result = read_kanban_task(self.server.config.hermes_home, key, time.monotonic() + DB_TIME_LIMIT)
+            if result is None:
+                return HTTPStatus.NOT_FOUND, b'{"error":"not_found"}'
+        body = json_body(result)
+        if len(body) > MAX_SNAPSHOT_BYTES:
+            raise SnapshotTooLarge
+        return HTTPStatus.OK, body
 
     def refuse_method(self):
         self.reply(HTTPStatus.METHOD_NOT_ALLOWED, b'{"error":"method_not_allowed"}', allow_get=True)

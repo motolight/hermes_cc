@@ -7,7 +7,8 @@ const root = new URL(prefix, host.origin);
 const extensions = 'api/extensions/hermes-command-center/sidecar/';
 
 export const emptyData = () => ({
-  agents: [], links: [], events: [], tasks: [], usage: [], gpus: [], services: [], metrics: {}, sources: [],
+  agents: [], runs: [], issues: [], links: [], events: [], tasks: [], usage: [], gpus: [], services: [], metrics: {}, sources: [],
+  history: null, access: false, at: null,
 });
 
 function source(id, label, status, detail, detailRu) {
@@ -49,6 +50,20 @@ function sidecarError(error) {
 }
 
 const validSession = session => typeof session === 'string' && /^[a-zA-Z0-9_-]{1,120}$/.test(session);
+const ranges = new Set(['1h', '24h', '7d', '30d']);
+
+export function readHistory(range) {
+  if (!ranges.has(range)) return Promise.reject(new Error('Invalid history range'));
+  return request(`${extensions}history/${range}`);
+}
+
+export async function readTaskDetail(id) {
+  if (typeof id !== 'string' || id.length > 160) throw new Error('Invalid task ID');
+  const task = await request(`${extensions}kanban/task?id=${encodeURIComponent(id)}`);
+  return { ...task, sessionHref: validSession(task.session) ? webuiHref(`session/${encodeURIComponent(task.session)}`) : task.sessionHref,
+    links: Array.isArray(task.links) ? task.links.map(link => link.kind === 'session' && validSession(link.id)
+      ? { ...link, href: webuiHref(`session/${encodeURIComponent(link.id)}`) } : link) : [] };
+}
 
 export async function readLive() {
   const live = emptyData();
@@ -64,31 +79,48 @@ export async function readLive() {
   }
   const [sidecar] = await Promise.allSettled([request(`${extensions}snapshot`)]);
   if (sidecar.status === 'fulfilled' && sidecar.value && typeof sidecar.value === 'object') {
+    live.access = true;
+    live.at = sidecar.value.at || null;
     for (const key of Object.keys(live)) {
       if (Array.isArray(live[key]) && Array.isArray(sidecar.value[key])) {
         live[key] = sidecar.value[key].filter(item => item && typeof item === 'object');
       }
     }
     if (sidecar.value.metrics && typeof sidecar.value.metrics === 'object') live.metrics = sidecar.value.metrics;
+    live.sources.push(source('hcc', 'Command Center proxy', 'available', 'Snapshot received through the authenticated WebUI proxy.',
+      'Данные получены через авторизованный серверный прокси WebUI.'));
   } else {
     live.sources.push(sidecarError(sidecar.reason));
   }
-  live.agents = live.agents.filter(agent => typeof agent.id === 'string' && typeof agent.name === 'string').map(agent => ({
+  const normalizeAgent = agent => ({
     ...agent,
-    href: agent.kind !== 'pi' && agent.kind !== 'executor' && validSession(agent.session)
-      ? webuiHref(`session/${encodeURIComponent(agent.session)}`) : agent.href,
-  }));
+    href: agent.href || (agent.kind !== 'pi' && agent.source !== 'pi' && validSession(agent.session)
+      ? webuiHref(`session/${encodeURIComponent(agent.session)}`) : null),
+  });
+  for (const list of ['agents', 'runs', 'issues']) {
+    live[list] = live[list].filter(agent => typeof agent.id === 'string' && typeof agent.name === 'string').map(normalizeAgent);
+  }
+  if (!Array.isArray(sidecar.value?.runs)) {
+    const active = new Set(['running', 'working', 'active', 'tool', 'generating', 'queued', 'stalled']);
+    live.runs = live.agents.filter(agent => agent.kind !== 'profile' && !active.has(agent.status));
+    live.agents = live.agents.filter(agent => agent.kind === 'profile' || active.has(agent.status));
+  }
   live.tasks = live.tasks.map(task => ({
     ...task, sessionHref: validSession(task.session) ? webuiHref(`session/${encodeURIComponent(task.session)}`) : task.sessionHref,
   }));
-  const agentsById = new Map(live.agents.map(agent => [agent.id, agent]));
+  const agentsById = new Map([...live.runs, ...live.agents].map(agent => [agent.id, agent]));
   live.events = live.events.map(event => ({
     ...event, href: event.href || agentsById.get(event.from)?.href || agentsById.get(event.to)?.href,
   }));
   const profiles = new Map(live.agents.filter(agent => agent.kind === 'profile').map(agent => [agent.profile || agent.name, agent]));
   for (const row of profile.profiles) {
     const agent = profileAgent(row);
-    if (!agent || profiles.has(agent.profile)) continue;
+    if (!agent) continue;
+    if (profiles.has(agent.profile)) {
+      const existing = profiles.get(agent.profile);
+      if (!existing.model && agent.model) existing.model = agent.model;
+      continue;
+    }
     live.agents.push(agent);
     profiles.set(agent.profile, agent);
   }

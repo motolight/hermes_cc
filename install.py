@@ -571,6 +571,7 @@ class Manager:
         self.public = guard(self.extensions / EXTENSION, "directory")
         self.private = guard(state / ("." + EXTENSION), "directory")
         self.runtime = guard(self.private / "live", "directory")
+        self.telemetry = guard(self.private / "telemetry", "directory")
         self.registry_path = state / REGISTRY
         self.overrides_path = state / OVERRIDES
         self.previous = self.private / "rollback.zip"
@@ -630,7 +631,7 @@ class Manager:
             value.get("id") != EXTENSION
             or type(value.get("systemd")) is not bool
             or type(value.get("unit_format", 1)) is not int
-            or value.get("unit_format", 1) not in (1, 2)
+            or value.get("unit_format", 1) not in (1, 2, 3)
             or not isinstance(value.get("files"), list)
             or not all(runtime_name(name) for name in value["files"])
             or set(value["files"]) != runtime.keys() - {RUNTIME_RECORD}
@@ -684,8 +685,10 @@ class Manager:
             "NoNewPrivileges=true", "UMask=0077",
             "Environment=" + unit_argument("HERMES_WEBUI_STATE_DIR=" + str(self.state)),
         ]
-        if record.get("unit_format", 1) == 2:
+        if record.get("unit_format", 1) >= 2:
             lines += ["PrivateUsers=true", "ProtectSystem=strict"]
+        if record.get("unit_format", 1) >= 3:
+            lines.append("ReadWritePaths=" + unit_argument(str(self.telemetry)))
         if hermes_home is not None:
             lines.append("Environment=" + unit_argument("HCC_HERMES_HOME=" + hermes_home))
         if metrics_origin is not None:
@@ -717,7 +720,7 @@ class Manager:
         if gpu_user is not None:
             validate_gpu_ssh(gpu_user, metrics_origin)
         runtime[RUNTIME_RECORD] = json_bytes({
-            "id": EXTENSION, "systemd": managed, "files": sorted(runtime), "unit_format": 2,
+            "id": EXTENSION, "systemd": managed, "files": sorted(runtime), "unit_format": 3,
             "python": str(Path(sys.executable).resolve()), "unit_path": str(self.unit_path),
             "hermes_home": str(Path(args.hermes_home).expanduser().resolve()) if args.hermes_home else prior.get("hermes_home"),
             "vllm_origin": metrics_origin, "gpu_ssh_user": gpu_user,
@@ -789,6 +792,11 @@ class Manager:
             raise InstallError("HCC sidecar files changed during setup.")
         if other_unit or target_unit:
             systemctl("show-environment")
+        if self.runtime_record(target["runtime"]).get("unit_format", 1) >= 3:
+            guard(self.telemetry, "directory").mkdir(mode=0o700, exist_ok=True)
+            info = self.telemetry.stat()
+            if hasattr(os, "geteuid") and (info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700):
+                raise InstallError("The HCC telemetry directory must be owned by the service user and mode 0700.")
         if current_unit is not None:
             systemctl("disable", "--now", UNIT)
         if target["entry"] is None:

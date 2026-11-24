@@ -5,7 +5,8 @@ import time
 import unittest
 from pathlib import Path
 
-from kanban import MAX_ATTEMPTS, collect_kanban
+from kanban import (BODY_LIMIT_BYTES, MAX_ATTEMPTS, MAX_DETAIL_COMMENTS, MAX_DETAIL_EVENTS,
+                    MAX_TASK_DETAIL_BYTES, NOTE_LIMIT_BYTES, collect_kanban, read_kanban_task)
 
 
 TASK_SCHEMA = """
@@ -29,6 +30,9 @@ class KanbanTest(unittest.TestCase):
 
     def collect(self):
         return collect_kanban(self.home, time.monotonic() + 2)
+
+    def detail(self, key):
+        return read_kanban_task(self.home, key, time.monotonic() + 2)
 
     def test_native_paths_references_and_read_only_wal(self):
         default = self.home / "kanban.db"
@@ -106,3 +110,137 @@ class KanbanTest(unittest.TestCase):
         tasks, source = self.collect()
         self.assertEqual([], tasks)
         self.assertEqual("available", source["status"])
+
+    def test_detail_uses_native_attempts_events_and_link_evidence(self):
+        path = self.home / "kanban.db"
+        with sqlite3.connect(path) as db:
+            db.executescript(TASK_SCHEMA + """
+                ALTER TABLE tasks ADD COLUMN completion_contract TEXT;
+                ALTER TABLE tasks ADD COLUMN result TEXT;
+                ALTER TABLE tasks ADD COLUMN current_run_id INTEGER;
+                ALTER TABLE tasks ADD COLUMN block_kind TEXT;
+                ALTER TABLE tasks ADD COLUMN last_heartbeat_at INTEGER;
+                ALTER TABLE task_events ADD COLUMN kind TEXT;
+                ALTER TABLE task_events ADD COLUMN run_id INTEGER;
+                ALTER TABLE task_runs ADD COLUMN profile TEXT;
+                ALTER TABLE task_runs ADD COLUMN last_heartbeat_at INTEGER;
+                ALTER TABLE task_runs ADD COLUMN outcome TEXT;
+                ALTER TABLE task_runs ADD COLUMN error TEXT;
+                CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, author TEXT,
+                                            body TEXT, created_at INTEGER);
+                INSERT INTO tasks (id,title,status) VALUES ('t_parent','Parent','archived'),
+                                                            ('t_descendant','Descendant','todo');
+                INSERT INTO task_links VALUES ('t_parent','t_main'), ('t_main','t_descendant');
+            """)
+            description = "Задача по сборке.\n\n## Критерии\n\n- [ ] Проверить сборку.\n" + "Детали " * 500
+            contract = "https://github.com/org/repo/pull/44"
+            db.execute("""INSERT INTO tasks (id,title,body,status,assignee,session_id,completion_contract,
+                                             result,current_run_id,created_at,last_heartbeat_at,workspace_path)
+                          VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       ("t_main", "Сборка", description, "running", "assigned", "origin-session", contract,
+                        None, 2, 100, 171, "/private/workspace"))
+            db.execute("""INSERT INTO task_runs (id,task_id,status,started_at,ended_at,summary,metadata,
+                                                 profile,last_heartbeat_at,outcome,error)
+                          VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                       (1, "t_main", "done", 120, 141, "Previous run result", json.dumps({
+                           "published_pr": "https://github.com/org/repo/pull/43",
+                           "pi_job_id": "pb-unverified", "prompt": "DO-NOT-SEND",
+                       }), "previous", 139, "completed", "Authorization: fixture-private"))
+            db.execute("""INSERT INTO task_runs (id,task_id,status,started_at,profile,last_heartbeat_at)
+                          VALUES (2,'t_main','running',150,'actual-worker',170)""")
+            db.executemany("INSERT INTO task_events (id,task_id,kind,run_id,created_at,payload) VALUES (?,?,?,?,?,?)", [
+                (1, "t_main", "pr_acceptance", 1, 140, json.dumps({
+                    "pr_url": "https://github.com/org/repo/pull/43", "ok": True, "private": "DO-NOT-SEND",
+                })),
+                (2, "t_main", "heartbeat", 2, 170, json.dumps({"note": "Inspecting the build"})),
+                (3, "t_main", "edited", None, 173, json.dumps({"fields": ["title"], "value": "DO-NOT-SEND"})),
+                (4, "t_descendant", "dependency_wait", None, 172, json.dumps({"reason": "Waiting for the build"})),
+                (5, "t_main", "owner_admitted", 2, 151, json.dumps({
+                    "session_id": "native-worker-session", "db": "/private/workspace", "request_id": "DO-NOT-SEND",
+                })),
+            ])
+            db.executemany("INSERT INTO task_comments VALUES (?,?,?,?,?)", [
+                (1, "t_main", "reviewer", "Long comments retain\nparagraph breaks.", 160),
+                (2, "t_main", "reviewer", "System prompt: DO-NOT-SEND", 174),
+            ])
+        db.close()
+        before = path.read_bytes()
+
+        task = self.detail("default:t_main")
+
+        self.assertEqual(task["description"], description)
+        self.assertEqual(task["criteria"], contract)
+        self.assertEqual(task["assignee"], "assigned")
+        self.assertEqual(task["executor"], "actual-worker")
+        self.assertEqual(task["activity"]["latestEvent"]["summary"], "Inspecting the build")
+        self.assertEqual(task["activity"]["heartbeatAt"], "1970-01-01T00:02:50+00:00")
+        self.assertEqual(task["updatedAt"], "1970-01-01T00:02:54+00:00")
+        self.assertEqual(task["dependsOn"], [{"id": "default:t_parent", "title": "Parent", "status": "archived", "available": True}])
+        self.assertEqual(task["dependents"][0]["id"], "default:t_descendant")
+        self.assertEqual(self.detail("default:t_descendant")["blockedReason"], "Waiting for the build")
+        self.assertEqual(task["comments"][0]["body"], "[redacted]")
+        self.assertEqual(task["comments"][1]["body"], "Long comments retain\nparagraph breaks.")
+        self.assertEqual(task["events"][0]["details"]["changed_fields"], ["title"])
+        self.assertEqual(task["attempts"][1]["error"], "[redacted]")
+        self.assertIsNone(task["result"])
+        self.assertEqual(task["attempts"][1]["summary"], "Previous run result")
+        self.assertEqual([item["evidence"] for item in task["links"]],
+                         ["originatingSession", "workerSession", "completionAcceptance", "requiredByTask"])
+        self.assertEqual(task["links"][1]["runId"], 2)
+        for private in ("/private/workspace", "DO-NOT-SEND", "pb-unverified", "fixture-private"):
+            self.assertNotIn(private, json.dumps(task))
+        self.assertEqual(before, path.read_bytes())
+
+    def test_detail_scopes_boards_and_marks_limits_without_partial_text(self):
+        archived = self.home / "kanban" / "boards" / "retired"
+        archived.mkdir(parents=True)
+        with sqlite3.connect(archived / "kanban.db") as db:
+            db.executescript(TASK_SCHEMA)
+            db.execute("INSERT INTO tasks (id,title,status) VALUES ('t_main','Archived board','done')")
+        db.close()
+        (archived / "board.json").write_text('{"archived":true}', encoding="utf-8")
+        with sqlite3.connect(self.home / "kanban.db") as db:
+            db.executescript(TASK_SCHEMA + """
+                CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, author TEXT,
+                                            body TEXT, created_at INTEGER);
+                INSERT INTO task_links VALUES ('t_missing','t_main');
+            """)
+            db.execute("INSERT INTO tasks (id,title,body,status) VALUES ('t_main','Current board',?,'ready')",
+                       ("x" * BODY_LIMIT_BYTES + " token: FIXTURE",))
+            db.executemany("INSERT INTO task_comments VALUES (?, 't_main', 'human', ?, ?)",
+                           [(n, str(n), n) for n in range(1, MAX_DETAIL_COMMENTS + 2)])
+        db.close()
+
+        task = self.detail("default:t_main")
+
+        self.assertEqual(task["title"], "Current board")
+        self.assertEqual(task["limits"], ["body", "comments"])
+        self.assertTrue(task["description"].startswith("[omitted:"))
+        self.assertEqual(len(task["comments"]), MAX_DETAIL_COMMENTS)
+        self.assertFalse(task["dependsOn"][0]["available"])
+        self.assertIsNone(self.detail("retired:t_main"))
+        self.assertIsNone(self.detail("default:../../state.db"))
+        self.assertEqual([card["id"] for card in self.collect()[0]], ["default:t_main"])
+
+    def test_dense_history_fits_response_budget_and_preserves_full_description(self):
+        path = self.home / "kanban.db"
+        description = "a" * BODY_LIMIT_BYTES
+        with sqlite3.connect(path) as db:
+            db.executescript(TASK_SCHEMA + """
+                ALTER TABLE task_events ADD COLUMN kind TEXT;
+                CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, author TEXT,
+                                            body TEXT, created_at INTEGER);
+            """)
+            db.execute("INSERT INTO tasks (id,title,body,status) VALUES ('t_main','Main',?,'ready')", (description,))
+            db.executemany("INSERT INTO task_comments VALUES (?, 't_main', 'human', ?, ?)",
+                           [(n, "a" * NOTE_LIMIT_BYTES, n) for n in range(1, MAX_DETAIL_COMMENTS + 1)])
+            db.executemany("INSERT INTO task_events VALUES (?, 't_main', ?, ?, 'edited')",
+                           [(n, n, json.dumps({"summary": "a" * 22000})) for n in range(1, MAX_DETAIL_EVENTS + 1)])
+        db.close()
+
+        task = self.detail("default:t_main")
+
+        self.assertEqual(task["description"], description)
+        self.assertIn("events", task["limits"])
+        self.assertEqual(task["events"][0]["id"], MAX_DETAIL_EVENTS)
+        self.assertLessEqual(len(json.dumps(task, ensure_ascii=False, separators=(",", ":")).encode()), MAX_TASK_DETAIL_BYTES)

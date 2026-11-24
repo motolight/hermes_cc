@@ -1,7 +1,7 @@
 import { avatar, esc, icon, relTime, safeHref, statusChip } from './ui.js';
 import { bindGraph, renderGraph } from './graph.js';
 import { bindView, renderView } from './views.js';
-import { readLive, emptyData } from './live.js';
+import { readLive, readHistory, readTaskDetail, emptyData } from './live.js';
 
 const pages = {
   graph: ['Live Agent Graph', 'Граф агентов', 'Agent topology and recent handoffs', 'Связи агентов и недавние передачи задач'],
@@ -26,7 +26,7 @@ const embedded = parent !== window && location.protocol === 'about:';
 const state = {
   view: 'graph', theme: readPref('theme') === 'light' ? 'light' : 'dark',
   lang: readPref('lang') === 'ru' ? 'ru' : 'en',
-  demo: params.get('demo') === '1', data: emptyData(), filters: {},
+  demo: params.get('demo') === '1', data: emptyData(), filters: {}, histories: new Map(),
   updated: null, polling: false, pending: false, cleanup: null, closed: false, epoch: 0,
 };
 let demoModule;
@@ -37,18 +37,60 @@ const fmt = (value, options) => typeof value === 'number' && Number.isFinite(val
   : '—';
 
 function detail(title, html) {
-  returnFocus = document.activeElement;
+  if (!inspector.open) returnFocus = document.activeElement;
   inspector.innerHTML = `<div class="hcc-dialog-head"><h2 id="hcc-inspector-title">${esc(title)}</h2><button type="button" class="hcc-icon" data-inspector-close aria-label="${t('Close', 'Закрыть')}">${icon('close')}</button></div><div class="hcc-dialog-body">${html}</div>`;
   inspector.querySelector('[data-inspector-close]').onclick = () => inspector.close();
   if (!inspector.open) inspector.showModal();
   return inspector;
 }
 
+function currentRange() {
+  return state.filters[state.view]?.range || '24h';
+}
+
+function canRenderRefresh() {
+  return !inspector.open && !document.fullscreenElement &&
+    !document.activeElement?.matches('input,select,textarea') &&
+    !document.querySelector('.hcc-graph-stage.is-panning');
+}
+
+async function loadHistory(range, force = false) {
+  if (!state.demo && !state.data.access) return null;
+  const existing = state.histories.get(range);
+  if (existing?.request) return existing.request;
+  if (!force && existing && Date.now() - existing.time < 30000) return existing.value;
+  const epoch = state.epoch;
+  const pending = Promise.resolve().then(async () => {
+    if (state.demo) return (demoModule ||= await import('./demo.js')).demoHistory(range);
+    return readHistory(range);
+  }).catch(() => ({range, error: true})).then(value => {
+    if (epoch !== state.epoch || state.closed) return null;
+    state.histories.set(range, {value, time: Date.now()});
+    if (['usage', 'infrastructure'].includes(state.view) && currentRange() === range) {
+      if (canRenderRefresh()) renderContent(true);
+      else state.pending = true;
+    }
+    return value;
+  });
+  state.histories.set(range, {...existing, request: pending});
+  return pending;
+}
+
 const ctx = {
   root: document, t, esc, fmt, icon, avatar, safeHref, detail,
   get lang() { return state.lang; },
-  get data() { return state.data; },
+  get data() { return {...state.data, history: state.histories.get(currentRange())?.value || null}; },
   get demo() { return state.demo; },
+  get loading() { return !state.updated; },
+  async taskDetail(id) {
+    if (state.demo) return (demoModule ||= await import('./demo.js')).demoTaskDetail(id);
+    if (!state.data.access) throw new Error('Task detail unavailable');
+    const epoch = state.epoch;
+    const result = await readTaskDetail(id);
+    if (epoch !== state.epoch || !state.data.access) throw new Error('Task detail unavailable');
+    return result;
+  },
+  loadHistory,
   filters(view) { return state.filters[view] ||= {}; },
   update: () => renderContent(true),
   status: value => statusChip(value, t),
@@ -109,6 +151,7 @@ function renderShell() {
     state.updated = null;
     state.data = emptyData();
     state.filters = {};
+    state.histories.clear();
     renderHeader();
     renderContent();
     await poll();
@@ -141,7 +184,13 @@ function renderHeader() {
     <div class="hcc-sync"><span class="hcc-sync-dot ${available ? 'is-ready' : ''}"></span><div><strong>${syncStatus}</strong><small>${state.updated ? `${t('Synced', 'Обновлено')} ${esc(ctx.rel(state.updated))}` : t('Checking availability', 'Проверка доступности')}</small></div></div>`;
   shell.querySelector('#hcc-nav-foot').innerHTML = `<button class="hcc-source-link" type="button" data-sources aria-label="${t('Data sources', 'Источники данных')}">${icon('terminal', 16)}<span>${t('Data sources', 'Источники данных')}</span>${icon('chevron', 13)}</button>`;
   shell.querySelector('[data-sources]').onclick = () => detail(t('Data sources', 'Источники данных'), state.data.sources.length
-    ? state.data.sources.map(source => `<section class="hcc-source-row"><div><strong>${esc(source.label)}</strong><p>${esc(t(source.detail, source.detailRu || source.detail))}</p></div>${ctx.status(source.status)}</section>`).join('')
+    ? state.data.sources.map(source => `<section class="hcc-source-row"><div><strong>${esc(source.label)}</strong><p>${esc(t(source.detail, source.detailRu || source.detail))}</p>
+      ${source.lastSuccessAt ? `<p>${t('Last successful collection','Последний успешный сбор')} · ${esc(ctx.rel(source.lastSuccessAt))}</p>` : ''}
+      ${source.missing?.length ? `<p>${t('Missing','Нет данных')} · ${esc(source.missing.join(', '))}</p>` : ''}
+      ${source.limits?.length ? `<ul>${source.limits.map(limit => `<li>${esc(limit)}</li>`).join('')}</ul>` : ''}
+      ${source.impact ? `<p>${esc(source.impact)}</p>` : ''}
+      ${source.recommendation ? `<p>${esc(source.recommendation)}</p>` : ''}
+      </div>${ctx.status(source.status)}</section>`).join('')
     : `<p class="hcc-muted">${t('No sources connected.', 'Источники не подключены.')}</p>`);
   const refresh = shell.querySelector('#hcc-refresh');
   refresh.classList.toggle('is-spinning', state.polling);
@@ -178,12 +227,24 @@ async function poll(force = false) {
     next = { ...emptyData(), sources: [{ id: 'webui', label: 'Hermes WebUI', status: 'unavailable' }] };
   }
   if (epoch !== state.epoch || state.closed) return;
+  const lostAccess = !state.demo && state.data.access && !next.access;
   state.data = next;
   state.polling = false;
   state.updated = Date.now();
+  if (lostAccess) {
+    state.epoch += 1;
+    state.histories.clear();
+    state.pending = false;
+    if (inspector.open) inspector.close();
+    inspector.replaceChildren();
+    renderHeader();
+    renderContent();
+    return;
+  }
   if (!shell.contains(shell.querySelector('#hcc-pages')?.querySelector(':focus'))) renderHeader();
   else shell.querySelector('#hcc-refresh')?.classList.remove('is-spinning');
-  if (inspector.open || document.fullscreenElement || document.activeElement?.matches('input,select,textarea') || document.querySelector('.hcc-graph-stage.is-panning')) {
+  if (['usage', 'infrastructure'].includes(state.view)) loadHistory(currentRange());
+  if (!canRenderRefresh()) {
     state.pending = true;
     return;
   }
