@@ -1,10 +1,19 @@
-import { timestamp } from './ui.js';
+import { statusLabel, timestamp } from './ui.js';
 
 const WIDTH = 1000;
 const HEIGHT = 575;
 const animatedEvents = new Set();
 const liveStates = new Set(['active', 'running', 'working', 'generating', 'tool', 'in_progress', 'queued', 'stalled']);
 const eventIcons = { delegation: 'arrow', message: 'communications', tool: 'terminal', result: 'check', error: 'alert', approval: 'task' };
+const isTopology = agent => agent.kind === 'pi-runtime' || agent.kind === 'pi-role';
+const isExecutor = agent => agent.kind !== 'profile' && !isTopology(agent) &&
+  (agent.active ?? liveStates.has(agent.status));
+const isDefaultProfile = agent => agent.kind === 'profile' && (agent.profile || agent.name) === 'default';
+const piRouteModes = [
+  { mode: 'recent-pi', dataKey: 'recentPi', label: ['Latest observed Pi route', 'Последний маршрут Pi'],
+    heading: ['Latest observed Pi route', 'Последний наблюдавшийся маршрут Pi'] },
+  { mode: 'recent-pi-delegation', dataKey: 'recentPiDelegation', label: ['Latest Open Agents route', 'Последний маршрут Open Agents'] },
+];
 
 function values(entities, key) {
   return [...new Set(entities.map(item => item[key]).filter(Boolean).map(String))].sort();
@@ -12,7 +21,18 @@ function values(entities, key) {
 
 function graphModel(ctx) {
   const f = ctx.filters('graph');
-  const live = ctx.data.agents.filter(agent => agent.kind === 'profile' || (agent.active ?? liveStates.has(agent.status)));
+  const routeMode = piRouteModes.find(option => option.mode === f.mode);
+  const route = routeMode && ctx.data[routeMode.dataKey];
+  if (route?.nodes?.length) {
+    const agents = route.nodes;
+    const shown = agents.slice(0, 24);
+    const chosen = agents.find(agent => agent.id === f.routeViews?.[f.mode]?.selected) || shown[0];
+    if (!shown.includes(chosen)) shown[shown.length - 1] = chosen;
+    return { agents, shown, chosen, edges: visibleEdges(shown, route.links), events: [], tasks: [], route, routeMode };
+  }
+  const live = ctx.data.agents.filter(agent => agent.kind === 'profile' || isExecutor(agent));
+  const inventory = new Map((ctx.data.piAgents || []).filter(isTopology).map(agent => [agent.id, agent]));
+  for (const agent of live) inventory.set(agent.id, agent);
   const communications = ctx.data.events.filter(event => event.channel === 'communication');
   const entities = [...live, ...ctx.data.tasks, ...communications];
   const matching = item => ['project', 'team', 'session'].every(key => !f[key] || item[key] === f[key]);
@@ -20,6 +40,8 @@ function graphModel(ctx) {
   const events = communications.filter(matching).sort((a, b) => (timestamp(b.at) || 0) - (timestamp(a.at) || 0));
   const tasks = ctx.data.tasks.filter(matching);
   const relevant = new Set([...events.flatMap(item => [item.from, item.to]), ...tasks.map(item => item.assignee)]);
+  const links = [...ctx.data.links, ...events.filter(event => ['message', 'delegation', 'result'].includes(event.kind)),
+    ...(ctx.data.piLinks || [])];
   const connected = new Map();
   for (const link of ctx.data.links) {
     if (link.from && link.to && link.from !== link.to) {
@@ -28,37 +50,58 @@ function graphModel(ctx) {
     }
   }
   const score = agent => (connected.get(agent.id) || 0) + Number(agent.kind === 'profile') * 2 + Number(liveStates.has(agent.status));
-  const eligible = live.filter(agent => !scoped || matching(agent) || relevant.has(agent.id) || relevant.has(agent.profile))
-    .sort((a, b) => score(b) - score(a) || a.name.localeCompare(b.name));
-  const agents = eligible.filter(agent => !f.kind || (f.kind === 'profile') === (agent.kind === 'profile'));
+  const priority = agent => isDefaultProfile(agent) ? 2 : Number(isTopology(agent));
+  const eligible = [...inventory.values()]
+    .filter(agent => !scoped || matching(agent) || relevant.has(agent.id) || relevant.has(agent.profile))
+    .sort((a, b) => priority(b) - priority(a) || score(b) - score(a) || a.name.localeCompare(b.name));
+  const agents = eligible.filter(agent => !f.kind || (f.kind === 'profile' ? agent.kind === 'profile' : isExecutor(agent)));
   const chosen = agents.find(agent => agent.id === f.selected) || agents[0];
   const shown = agents.slice(0, 24);
   if (chosen && !shown.includes(chosen)) shown[shown.length - 1] = chosen;
+  return { agents, shown, chosen, events, tasks, entities, edges: visibleEdges(shown, links) };
+}
+
+function visibleEdges(shown, links) {
   const population = new Set(shown.map(agent => agent.id));
   const edges = new Map();
-  for (const link of [...ctx.data.links, ...events.filter(event => ['message', 'delegation', 'result'].includes(event.kind))]) {
+  for (const link of links) {
     if (!population.has(link.from) || !population.has(link.to) || link.from === link.to) continue;
     const key = `${link.from}\u0000${link.to}`;
     if (!edges.has(key)) edges.set(key, link);
   }
-  return { agents, shown, chosen, events, tasks, entities, edges: [...edges.values()] };
+  return [...edges.values()];
 }
 
 export function placeAgents(agents, edges = []) {
   if (!agents.length) return [];
   if (agents.length === 1) return [{ x: 500, y: 285 }];
-  if (agents.some(agent => agent.kind === 'pi') && agents.length <= 15) {
-    const ids = new Set(agents.filter(agent => agent.kind === 'pi').map(agent => agent.id));
-    const child = new Set(edges.filter(edge => ids.has(edge.from) && edge.kind !== 'message').map(edge => edge.to));
-    const levels = agents.map(agent => agent.kind === 'profile' ? 0
-      : agent.kind === 'pi' ? 2 : child.has(agent.id) ? 3 : agent.kind === 'subagent' ? 2 : 1);
-    const columns = [...new Set(levels)].sort((a, b) => a - b);
-    if (columns.length > 1 && columns.every(level => levels.filter(value => value === level).length <= 5)) {
-      return levels.map((level, index) => {
-        const count = levels.filter(value => value === level).length;
-        const row = levels.slice(0, index).filter(value => value === level).length;
-        return { x: 145 + columns.indexOf(level) * 710 / (columns.length - 1),
-          y: 292 + (row - (count - 1) / 2) * Math.min(154, 455 / Math.max(1, count - 1)) };
+  if (agents.some(agent => agent.kind === 'pi' || isTopology(agent))) {
+    const runtimeIds = new Set(agents.filter(agent => agent.kind === 'pi-runtime').map(agent => agent.id));
+    const piIds = new Set(agents.filter(agent => agent.kind === 'pi').map(agent => agent.id));
+    const runtimeRuns = new Set(edges.filter(edge => edge.kind === 'execution' &&
+      runtimeIds.has(edge.from) && piIds.has(edge.to)).map(edge => edge.to));
+    const childLevel = new Map();
+    for (const {from, to, kind} of edges) {
+      if (piIds.has(from) && kind !== 'message') childLevel.set(to, runtimeRuns.has(from) ? 4 : 3);
+    }
+    const levels = agents.map(agent => {
+      if (agent.kind === 'profile') return 0;
+      if (agent.kind === 'pi-runtime') return 2;
+      if (agent.kind === 'pi') return runtimeRuns.has(agent.id) ? 3 : 2;
+      if (agent.kind === 'pi-role') return 3;
+      return childLevel.get(agent.id) || (agent.kind === 'subagent' ? 2 : 1);
+    });
+    const columns = new Map();
+    for (const level of levels) columns.set(level, (columns.get(level) || 0) + 1);
+    const ordered = [...columns.keys()].sort((a, b) => a - b);
+    if (ordered.length > 1 && [...columns.values()].every(count => count <= 5)) {
+      const rowByLevel = new Map();
+      return levels.map(level => {
+        const count = columns.get(level);
+        const row = rowByLevel.get(level) || 0;
+        rowByLevel.set(level, row + 1);
+        return { x: 145 + ordered.indexOf(level) * 710 / (ordered.length - 1),
+          y: 283 + (row - (count - 1) / 2) * Math.min(142, 426 / Math.max(1, count - 1)) };
       });
     }
   }
@@ -84,11 +127,12 @@ export function placeAgents(agents, edges = []) {
   });
 }
 
-function curve(a, b) {
+function curve(a, b, trim = 0) {
   const dx = b.x - a.x;
   const dy = b.y - a.y;
   const shift = Math.max(-36, Math.min(36, dx * -.13));
-  return `M ${a.x} ${a.y - 18} C ${a.x + dx * .37 + shift} ${a.y + dy * .08 - 18}, ${a.x + dx * .67 + shift} ${b.y - dy * .08 - 18}, ${b.x} ${b.y - 18}`;
+  const scale = trim / (Math.hypot(dx, dy) || 1);
+  return `M ${a.x} ${a.y - 18} C ${a.x + dx * .37 + shift} ${a.y + dy * .08 - 18}, ${a.x + dx * .67 + shift} ${b.y - dy * .08 - 18}, ${b.x - dx * scale} ${b.y - dy * scale - 18}`;
 }
 
 function filterSelect(key, en, ru, options, ctx) {
@@ -97,10 +141,11 @@ function filterSelect(key, en, ru, options, ctx) {
 }
 
 function mapSvg(model, coords) {
-  const paths = model.edges.map(edge => ({
-    path: curve(coords.get(edge.from), coords.get(edge.to)),
-    kind: ['delegation', 'delegate', 'message', 'dependency'].includes(edge.kind) ? edge.kind : 'observed',
-  }));
+  const paths = model.edges.map(edge => {
+    const kind = model.route ? 'historical'
+      : ['delegation', 'delegate', 'message', 'dependency', 'configured', 'integration'].includes(edge.kind) ? edge.kind : 'observed';
+    return { kind, path: curve(coords.get(edge.from), coords.get(edge.to), kind === 'historical' ? 34 : 0) };
+  });
   const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
   const packets = reduced ? [] : model.events.filter(event => event.id && !animatedEvents.has(event.id) &&
     Date.now() - timestamp(event.at) < 45000 && Date.now() >= timestamp(event.at) &&
@@ -109,7 +154,9 @@ function mapSvg(model, coords) {
   return `<svg class="hcc-world-svg" width="${WIDTH}" height="${HEIGHT}" viewBox="0 0 ${WIDTH} ${HEIGHT}" aria-hidden="true">
     <defs><pattern id="hcc-grid" width="76" height="76" x="6" y="16" patternUnits="userSpaceOnUse"><path class="grid-line" d="M76 0H0v76" fill="none"/></pattern>
       <radialGradient id="hcc-orbit-fade"><stop offset="0%" stop-color="white"/><stop offset="88%" stop-color="white" stop-opacity=".3"/><stop offset="100%" stop-color="white" stop-opacity="0"/></radialGradient>
-      <mask id="hcc-field-mask"><ellipse cx="500" cy="285" rx="509" ry="306" fill="url(#hcc-orbit-fade)"/></mask></defs>
+      <mask id="hcc-field-mask"><ellipse cx="500" cy="285" rx="509" ry="306" fill="url(#hcc-orbit-fade)"/></mask>
+      <marker id="hcc-route-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L8 4L0 8Z" fill="var(--amber)"/></marker>
+    </defs>
     <g class="hcc-orbits">
       <rect x="5" y="5" width="990" height="565" fill="url(#hcc-grid)" stroke="none" mask="url(#hcc-field-mask)"/>
       <ellipse cx="500" cy="267" rx="324" ry="201" class="orbit-dash"/>
@@ -118,10 +165,17 @@ function mapSvg(model, coords) {
       <circle cx="500" cy="267" r="118" stroke-opacity=".48"/>
       <path d="M500 25v43m0 398v43M105 267h44m702 0h44"/>
     </g>
-    <g class="hcc-edge-glow">${paths.map(edge => `<path d="${edge.path}"/>`).join('')}</g>
-    <g class="hcc-edges">${paths.map(edge => `<path d="${edge.path}" class="kind-${edge.kind}"/>`).join('')}</g>
+    <g class="hcc-edge-glow">${paths.filter(edge => !['configured', 'historical'].includes(edge.kind)).map(edge => `<path d="${edge.path}"/>`).join('')}</g>
+    <g class="hcc-edges">${paths.map(edge => `<path d="${edge.path}" class="kind-${edge.kind}" data-graph-link="${edge.kind}"${edge.kind === 'historical' ? ' marker-end="url(#hcc-route-arrow)"' : ''}/>`).join('')}</g>
     ${packets.map((event, index) => `<circle class="hcc-packet" r="3.5" opacity="0" data-packet-index="${model.events.indexOf(event)}"><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.12;0.82;1" begin="${index * .19}s" dur="1.9s" fill="remove"/><animateMotion path="${curve(coords.get(event.from), coords.get(event.to))}" begin="${index * .19}s" dur="1.9s" fill="remove"/></circle>`).join('')}
   </svg>`;
+}
+
+function graphTime(value, ctx, routeTime = false) {
+  const time = timestamp(value);
+  if (!Number.isFinite(time)) return '';
+  const label = new Intl.DateTimeFormat(ctx.lang, {dateStyle: 'medium', timeStyle: 'medium'}).format(time);
+  return `<time datetime="${new Date(time).toISOString()}"${routeTime ? ' data-pi-route-time' : ''}>${ctx.esc(label)}</time>`;
 }
 
 function selectedPanel(agent, model, ctx) {
@@ -132,11 +186,11 @@ function selectedPanel(agent, model, ctx) {
   return `<div class="hcc-selected-agent">
     <div class="hcc-selected-summary">${avatar(agent, 48)}<div><strong>${esc(agent.name)}</strong><small>${esc(agent.role || agent.kind)}${agent.profile ? ` · ${esc(agent.profile)}` : ''}</small></div></div>
     <dl class="hcc-selected-meta">
-      <div><dt>${t('Status', 'Статус')}</dt><dd>${status(agent.status)}</dd></div>
+      <div><dt>${model.route ? t('Recorded status', 'Статус в записи') : t('Status', 'Статус')}</dt><dd>${status(agent.status)}</dd></div>
       <div><dt>${t('Model', 'Модель')}</dt><dd>${esc(agent.model || '—')}</dd></div>
-      <div><dt>${t('Current task', 'Текущая задача')}</dt><dd>${esc(task || '—')}</dd></div>
+      <div><dt>${model.route ? t('Recorded task', 'Задача в записи') : t('Current task', 'Текущая задача')}</dt><dd>${esc(task || '—')}</dd></div>
       <div><dt>${t('Last action', 'Последнее действие')}</dt><dd>${esc(agent.lastAction || activity?.title || '—')}</dd></div>
-      <div><dt>${t('Last activity', 'Последняя активность')}</dt><dd>${esc(ctx.rel(agent.updatedAt || activity?.at))}</dd></div>
+      <div><dt>${model.route ? t('Recorded at', 'Время записи') : t('Last activity', 'Последняя активность')}</dt><dd>${model.route ? graphTime(agent.updatedAt || agent.startedAt, ctx) || '—' : esc(ctx.rel(agent.updatedAt || activity?.at))}</dd></div>
     </dl>
     <button type="button" class="hcc-quiet-button" data-graph-detail>${t('Inspect agent', 'Сведения об агенте')} ${icon('arrow', 14)}</button>
   </div>`;
@@ -151,19 +205,20 @@ function currentTask(agent, tasks) {
   )?.title;
 }
 
-function graphNavigation(ctx, history, counts) {
+function graphNavigation(ctx, mode, counts) {
   const {t, fmt, icon} = ctx;
   const f = ctx.filters('graph');
   return `<div class="hcc-graph-nav">
-    <div class="hcc-segments" aria-label="${t('Graph mode','Режим графа')}">
-      <button type="button" data-graph-mode="live" aria-pressed="${!history}">${icon('graph', 16)}${t('Live topology','Живая карта')}</button>
-      <button type="button" data-graph-mode="history" aria-pressed="${history}">${icon('clock', 16)}${t('Run history','История запусков')} <small>${fmt(ctx.data.runs.length)}</small></button>
+    <div class="hcc-segments" role="group" aria-label="${t('Graph mode','Режим графа')}">
+      <button type="button" id="hcc-graph-mode-live" data-graph-mode="live" aria-pressed="${mode === 'live'}">${icon('graph', 16)}${t('Live topology','Живая карта')}</button>
+      ${piRouteModes.filter(option => ctx.data[option.dataKey]?.nodes?.length).map(option => `<button type="button" id="hcc-graph-mode-${option.mode}" data-graph-mode="${option.mode}" aria-pressed="${mode === option.mode}">${icon('activity', 16)}${t(...option.label)}</button>`).join('')}
+      <button type="button" id="hcc-graph-mode-history" data-graph-mode="history" aria-pressed="${mode === 'history'}">${icon('clock', 16)}${t('Run history','История запусков')} <small>${fmt(ctx.data.runs.length)}</small></button>
     </div>
-    ${history ? '' : `<div class="hcc-graph-counters">
+    ${mode === 'live' ? `<div class="hcc-graph-counters">
       <button type="button" data-graph-kind="profile" aria-pressed="${f.kind === 'profile'}"><strong>${fmt(counts.profiles)}</strong> ${t('Profiles','Профили')}</button>
-      <button type="button" data-graph-kind="executor" aria-pressed="${f.kind === 'executor'}"><strong>${fmt(counts.executors)}</strong> ${t('Executors','Исполнители')}</button>
+      <button type="button" data-graph-kind="executor" aria-pressed="${f.kind === 'executor'}"><strong>${fmt(counts.executors)}</strong> ${t('Active executors','Активные исполнители')}</button>
       <button type="button" data-graph-issues><strong>${fmt(ctx.data.issues.length)}</strong> ${t('Needs attention','Требуют внимания')}</button>
-    </div>`}
+    </div>` : ''}
   </div>`;
 }
 
@@ -180,7 +235,7 @@ function renderHistory(ctx) {
   const {t, esc, icon, status, rel, avatar} = ctx;
   const f = ctx.filters('graph');
   const model = historyModel(ctx);
-  return `${graphNavigation(ctx, true, {})}<section class="hcc-panel hcc-graph-history">
+  return `${graphNavigation(ctx, 'history')}<section class="hcc-panel hcc-graph-history">
     <header class="hcc-panel-title"><h2>${icon('clock', 16)}${t('Historical runs and sessions','Завершённые запуски и сессии')}</h2><span class="hcc-count">${ctx.fmt(model.rows.length)}</span></header>
     <div class="hcc-graph-history-search"><label for="hcc-history-search">${t('Search history','Поиск по истории')}</label><input id="hcc-history-search" type="search" value="${esc(f.historyQuery)}" placeholder="${t('Session, profile, model, task','Сессия, профиль, модель, задача')}"></div>
     ${model.pageRows.length ? model.pageRows.map((run, index) => `<button type="button" class="hcc-history-run" data-graph-run="${index}">
@@ -211,37 +266,54 @@ function graphMessageCards(model, coords, ctx) {
 }
 
 export function renderGraph(ctx) {
-  const { esc, t, icon, status, avatar, rel } = ctx;
+  const { esc, t, icon, avatar, rel, status } = ctx;
   const f = ctx.filters('graph');
   if (f.mode === 'history') return renderHistory(ctx);
   const model = graphModel(ctx);
+  const graphView = model.route ? f.routeViews?.[f.mode] : f;
   const coords = new Map(placeAgents(model.shown, model.edges).map((pos, i) => [model.shown[i].id, pos]));
-  const active = model.agents.filter(agent => agent.kind !== 'profile').length;
+  const active = model.agents.filter(isExecutor).length;
   const profiles = ctx.data.agents.filter(agent => agent.kind === 'profile').length;
+  const names = new Map(model.shown.map(agent => [agent.id, agent.name]));
   const heading = (name, glyph, right = '') => `<header class="hcc-panel-title"><h2>${icon(glyph, 15)}${name}</h2>${right}</header>`;
   const tool = (action, glyph, en, ru) => `<button type="button" class="hcc-icon" data-graph-action="${action}" aria-label="${t(en, ru)}" title="${t(en, ru)}">${icon(glyph, 15)}</button>`;
+  const legend = (kind, en, ru) => `<span class="kind-${kind}"><i></i>${t(en, ru)}</span>`;
   return `
-    ${graphNavigation(ctx, false, {profiles, executors: ctx.data.agents.length - profiles})}
-    <div class="hcc-graph-tools">
+    ${graphNavigation(ctx, model.routeMode?.mode || 'live', {profiles, executors: ctx.data.agents.filter(isExecutor).length})}
+    ${model.route ? '' : `<div class="hcc-graph-tools">
       <span>${icon('filter', 15)}${t('Scope', 'Фильтры')}</span>
       ${filterSelect('project', 'All projects', 'Все проекты', values(model.entities, 'project'), ctx)}
       ${filterSelect('team', 'All teams', 'Все команды', values(model.entities, 'team'), ctx)}
       ${filterSelect('session', 'All sessions', 'Все сессии', values(model.entities, 'session'), ctx)}
-      <div class="hcc-legend"><span><i></i>${t('Observed relationship', 'Подтверждённая связь')}</span><span><i></i>${t('Delegation', 'Делегирование')}</span><span><i></i>${t('Message', 'Сообщение')}</span></div>
-    </div>
-    <div class="hcc-graph-layout" style="--side-width:${Number(f.sideWidth) || 288}px">
-      <section class="hcc-panel hcc-graph-card">
-        ${heading(t('Agent topology', 'Топология агентов'), 'graph', `<span class="hcc-graph-subline hcc-live"><i></i>${ctx.fmt(active)} ${t('active', 'активно')} · ${ctx.fmt(model.agents.length)} ${t('total', 'всего')}</span>`)}
-        <div class="hcc-graph-stage" tabindex="0" aria-label="${t('Interactive topology. Use arrow keys to pan.', 'Интерактивная топология. Стрелки перемещают граф.')}">
+      <div class="hcc-legend">
+        ${legend('observed', 'Observed relationship', 'Подтверждённая связь')}
+        ${legend('delegation', 'Delegation', 'Делегирование')}
+        ${legend('message', 'Message', 'Сообщение')}
+        ${model.edges.some(edge => edge.kind === 'integration') ? legend('integration', 'Verified integration', 'Проверенная интеграция') : ''}
+        ${model.edges.some(edge => edge.kind === 'configured') ? legend('configured', 'Configured role', 'Роль из конфигурации') : ''}
+      </div>
+    </div>`}
+    <div class="hcc-graph-layout" style="--side-width:${Number(graphView?.sideWidth) || 288}px">
+      <section class="hcc-panel hcc-graph-card${model.route ? ' is-historical' : ''}">
+        ${model.route ? heading(t(...(model.routeMode.heading || model.routeMode.label)), 'clock',
+          `<span class="hcc-graph-subline hcc-route-time">${t('Historical', 'Архивная запись')} ${graphTime(model.route.at, ctx, true)}</span>`)
+          : heading(t('Agent topology', 'Топология агентов'), 'graph', `<span class="hcc-graph-subline hcc-live${active ? ' has-active' : ''}"><i></i><span data-graph-active-count="${active}">${ctx.fmt(active)} ${t('active', 'активно')}</span> · ${ctx.fmt(model.agents.length)} ${t('total', 'всего')}</span>`)}
+        <div class="hcc-graph-stage" tabindex="0" aria-label="${model.route
+          ? t('Historical route. Use arrow keys to pan.', 'Архивный маршрут. Стрелки перемещают граф.')
+          : t('Interactive topology. Use arrow keys to pan.', 'Интерактивная топология. Стрелки перемещают граф.')}">
+          ${model.route && model.edges.length ? `<ul class="hcc-route-links" aria-label="${t('Recorded links', 'Связи в записи')}">${model.edges.map(edge => `<li>${esc(names.get(edge.from))} ${t('to', '→')} ${esc(names.get(edge.to))}</li>`).join('')}</ul>` : ''}
           <div class="hcc-world">
             ${mapSvg(model, coords)}
             ${model.shown.map((agent, index) => {
               const pos = coords.get(agent.id);
               const task = currentTask(agent, model.tasks);
               const label = String(agent.status || '').replace(/[^a-z_]/g, '');
-              return `<button type="button" class="hcc-node ${index === 0 ? 'is-core' : ''} ${agent.id === model.chosen?.id ? 'is-selected' : ''}" style="left:${pos.x}px;top:${pos.y}px" data-graph-agent="${esc(agent.id)}" aria-pressed="${agent.id === model.chosen?.id}">
+              const description = model.route ? statusLabel(agent.status, t)
+                : agent.kind === 'pi-role' ? t('Configured role', 'Роль из конфигурации')
+                : agent.role || agent.kind || '—';
+              return `<button type="button" class="hcc-node ${index === 0 ? 'is-core' : ''} ${agent.id === model.chosen?.id ? 'is-selected' : ''}" style="left:${pos.x}px;top:${pos.y}px" data-graph-agent="${esc(agent.id)}" data-graph-node-kind="${esc(agent.kind)}" aria-pressed="${agent.id === model.chosen?.id}">
                 ${avatar(agent, index === 0 ? 72 : 50)}<span class="node-status state-${esc(label)}"></span>
-                <span class="node-label"><strong>${esc(agent.name)}</strong><small>${esc(agent.role || agent.kind || '—')}${!ctx.demo && agent.kind !== 'profile' && agent.profile ? ` · ${esc(agent.profile)}` : ''}</small></span>
+                <span class="node-label"><strong>${esc(agent.name)}</strong><small>${esc(description)}${!model.route && !ctx.demo && agent.kind !== 'profile' && !isTopology(agent) && agent.profile ? ` · ${esc(agent.profile)}` : ''}</small></span>
                 ${task ? `<span class="node-task">${esc(task)}</span>` : ''}
               </button>`;
             }).join('')}
@@ -252,43 +324,43 @@ export function renderGraph(ctx) {
           <div class="hcc-stage-tools">${tool('out','minus','Zoom out','Уменьшить')}<output aria-live="off">100%</output>${tool('in','plus','Zoom in','Увеличить')}${tool('fit','fit','Fit topology','Вписать граф')}${tool('full','expand','Fullscreen','Полноэкранный режим')}</div>
         </div>
       </section>
-      <div class="hcc-resizer" role="separator" aria-orientation="vertical" aria-label="${t('Resize inspector', 'Изменить ширину панели')}" aria-valuemin="220" aria-valuemax="440" aria-valuenow="${Number(f.sideWidth) || 288}" tabindex="0"></div>
+      <div class="hcc-resizer" role="separator" aria-orientation="vertical" aria-label="${t('Resize inspector', 'Изменить ширину панели')}" aria-valuemin="220" aria-valuemax="440" aria-valuenow="${Number(graphView?.sideWidth) || 288}" tabindex="0"></div>
       <aside class="hcc-graph-side">
         <section class="hcc-panel">${heading(t('Agent inspector', 'Карточка агента'), 'activity')}${selectedPanel(model.chosen, model, ctx)}</section>
-        <section class="hcc-panel">${heading(t('Agents in scope', 'Агенты в выборке'), 'team', `<span class="hcc-count">${model.agents.length}</span>`)}
+        <section class="hcc-panel">${heading(model.route ? t('Observed participants', 'Участники маршрута') : t('Agents in scope', 'Агенты в выборке'), 'team', `<span class="hcc-count">${model.agents.length}</span>`)}
           ${model.agents.length ? `<div class="hcc-agent-rows">${model.agents.map(agent => `<button type="button" class="hcc-agent-row" data-graph-agent="${esc(agent.id)}">${avatar(agent, 25)}<span><strong>${esc(agent.name)}</strong><small>${esc(agent.role || agent.kind || '—')}</small></span>${status(agent.status)}</button>`).join('')}</div>` : `<p class="hcc-empty-text">${t('No matching agents.', 'Подходящих агентов нет.')}</p>`}
         </section>
       </aside>
     </div>
-    <section class="hcc-panel hcc-recent">
+    ${model.route ? '' : `<section class="hcc-panel hcc-recent">
       ${heading(t('Recent handoffs', 'Недавние передачи'), 'activity', `<button type="button" class="hcc-quiet-button" data-graph-activity>${t('Open feed', 'Открыть ленту')} ${icon('arrow', 13)}</button>`)}
       ${model.events.length ? `<div class="hcc-event-list">${model.events.slice(0, 3).map((event, i) => `<button type="button" data-graph-event="${i}">
         <span class="hcc-event-icon">${icon(eventIcons[event.kind] || 'activity', 15)}</span>
         <span><strong>${esc(event.title || event.kind)}</strong><small>${esc(rel(event.at))}${event.body ? ` · ${esc(event.body)}` : ''}</small></span>
       </button>`).join('')}</div>` : `<p class="hcc-empty-text">${t('No events from the current sources and filters.', 'В текущих источниках и фильтрах нет событий.')}</p>`}
-    </section>`;
+    </section>`}`;
 }
 
 export function bindGraph(ctx) {
   const container = ctx.root.querySelector('.hcc-content');
-  const f = ctx.filters('graph');
+  const filters = ctx.filters('graph');
   const { esc, t, detail } = ctx;
   container.querySelectorAll('[data-graph-mode]').forEach(button => {
-    button.onclick = () => { f.mode = button.dataset.graphMode; ctx.update(); };
+    button.onclick = () => { filters.mode = button.dataset.graphMode; ctx.update(); };
   });
-  if (f.mode === 'history') {
+  if (filters.mode === 'history') {
     const history = historyModel(ctx);
     const search = container.querySelector('#hcc-history-search');
     const updateSearch = event => {
       if (event.isComposing) return;
-      f.historyQuery = search.value;
-      f.historyPage = 0;
+      filters.historyQuery = search.value;
+      filters.historyPage = 0;
       ctx.update();
     };
     search.oninput = updateSearch;
     search.oncompositionend = updateSearch;
     container.querySelectorAll('[data-history-page]').forEach(button => {
-      button.onclick = () => { f.historyPage = history.page + Number(button.dataset.historyPage); ctx.update(); };
+      button.onclick = () => { filters.historyPage = history.page + Number(button.dataset.historyPage); ctx.update(); };
     });
     container.querySelectorAll('[data-graph-run]').forEach(button => {
       button.onclick = () => {
@@ -302,10 +374,13 @@ export function bindGraph(ctx) {
     });
     return;
   }
+  const model = graphModel(ctx);
+  const f = model.route ? ((filters.routeViews ||= {})[filters.mode] ||= {}) : filters;
   container.querySelectorAll('[data-graph-kind]').forEach(button => {
     button.onclick = () => { f.kind = f.kind === button.dataset.graphKind ? '' : button.dataset.graphKind; delete f.zoom; ctx.update(); };
   });
-  container.querySelector('[data-graph-issues]').onclick = () => {
+  const issues = container.querySelector('[data-graph-issues]');
+  if (issues) issues.onclick = () => {
     ctx.filters('team').teamScope = 'issues';
     ctx.navigate('team');
   };
@@ -314,7 +389,6 @@ export function bindGraph(ctx) {
   const layout = container.querySelector('.hcc-graph-layout');
   const separator = container.querySelector('.hcc-resizer');
   const world = stage.querySelector('.hcc-world');
-  const model = graphModel(ctx);
   let zoom = f.zoom || 1;
   let x = f.x || 0;
   let y = f.y || 0;
@@ -374,20 +448,20 @@ export function bindGraph(ctx) {
       <dl><dt>${t('Role', 'Роль')}</dt><dd>${esc(agent.role || agent.kind || '—')}</dd>
       <dt>${t('Profile', 'Профиль')}</dt><dd>${esc(agent.profile || '—')}</dd>
       <dt>${t('Model', 'Модель')}</dt><dd>${esc(agent.model || '—')}</dd>
-      <dt>${t('Status', 'Статус')}</dt><dd>${ctx.status(agent.status)}</dd>
+      <dt>${model.route ? t('Recorded status', 'Статус в записи') : t('Status', 'Статус')}</dt><dd>${ctx.status(agent.status)}</dd>
+      ${model.route ? `<dt>${t('Recorded at', 'Время записи')}</dt><dd>${graphTime(agent.updatedAt || agent.startedAt, ctx) || '—'}</dd>` : ''}
       <dt>${t('Session', 'Сессия')}</dt><dd>${esc(agent.session || '—')}</dd></dl>
       ${agent.detail ? `<p>${esc(agent.detail)}</p>` : ''}
       ${href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${t('Open native session', 'Открыть сессию')}</a>` : ''}
-      <h3>${t('Recent activity', 'Недавняя активность')}</h3>
-      ${related.length ? related.map(event => `<div class="hcc-source-row"><strong>${esc(event.title || event.kind)}</strong><small>${esc(ctx.rel(event.at))}</small></div>`).join('') : `<p class="hcc-muted">${t('No recent events.', 'Недавних событий нет.')}</p>`}`);
+      ${model.route ? '' : `<h3>${t('Recent activity', 'Недавняя активность')}</h3>
+      ${related.length ? related.map(event => `<div class="hcc-source-row"><strong>${esc(event.title || event.kind)}</strong><small>${esc(ctx.rel(event.at))}</small></div>`).join('') : `<p class="hcc-muted">${t('No recent events.', 'Недавних событий нет.')}</p>`}`}`);
   };
-  container.querySelector('[data-graph-activity]').onclick = () => ctx.navigate('communications');
+  const activity = container.querySelector('[data-graph-activity]');
+  if (activity) activity.onclick = () => ctx.navigate('communications');
   container.querySelectorAll('[data-graph-event]').forEach(button => {
     button.onclick = () => {
       const event = model.events[Number(button.dataset.graphEvent)];
-      const when = timestamp(event.at);
-      const absolute = Number.isFinite(when) ? new Intl.DateTimeFormat(ctx.lang, {dateStyle:'medium',timeStyle:'medium'}).format(when) : '—';
-      detail(event.title || event.kind, `<dl><dt>${t('From', 'От')}</dt><dd>${esc(model.agents.find(agent => agent.id === event.from)?.name || event.from || '—')}</dd><dt>${t('To', 'Кому')}</dt><dd>${esc(model.agents.find(agent => agent.id === event.to)?.name || event.to || '—')}</dd><dt>${t('Time', 'Время')}</dt><dd><time>${esc(absolute)}</time></dd></dl>${event.body || event.detail ? `<p class="hcc-message-body">${esc(event.body || event.detail)}</p>` : ''}`);
+      detail(event.title || event.kind, `<dl><dt>${t('From', 'От')}</dt><dd>${esc(model.agents.find(agent => agent.id === event.from)?.name || event.from || '—')}</dd><dt>${t('To', 'Кому')}</dt><dd>${esc(model.agents.find(agent => agent.id === event.to)?.name || event.to || '—')}</dd><dt>${t('Time', 'Время')}</dt><dd>${graphTime(event.at, ctx) || '—'}</dd></dl>${event.body || event.detail ? `<p class="hcc-message-body">${esc(event.body || event.detail)}</p>` : ''}`);
     };
   });
   stage.querySelectorAll('[data-graph-action]').forEach(button => {

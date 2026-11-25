@@ -71,6 +71,7 @@ const labels = {
   online: ['Online', 'Доступен'], available: ['Available', 'Доступно'], healthy: ['Healthy', 'В норме'],
   partial: ['Partial', 'Частично'], unavailable: ['Unavailable', 'Недоступно'],
   offline: ['Offline', 'Отключён'], ready: ['Ready', 'Готово к запуску'],
+  configured: ['Configured', 'Настроена'], observed: ['Observed', 'Наблюдалось'],
   review: ['In review', 'На проверке'], todo: ['To do', 'К выполнению'],
   in_progress: ['In progress', 'В работе'], canceled: ['Canceled', 'Отменено'],
   cancelled: ['Canceled', 'Отменено'], triage: ['Triage', 'Разбор'],

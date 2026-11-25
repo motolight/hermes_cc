@@ -8,6 +8,7 @@ const extensions = 'api/extensions/hermes-command-center/sidecar/';
 
 export const emptyData = () => ({
   agents: [], runs: [], issues: [], links: [], events: [], tasks: [], usage: [], gpus: [], services: [], metrics: {}, sources: [],
+  piAgents: [], piLinks: [], recentPi: null, recentPiDelegation: null,
   history: null, access: false, retryable: false, at: null,
 });
 
@@ -47,14 +48,13 @@ export function isAccessDenied(error) {
   return error?.denied === true || [0, 401, 403].includes(status) || (status >= 300 && status < 400);
 }
 
-function profileAgent(row) {
+function profileConfiguration(row) {
   const name = typeof row?.name === 'string' && /^[\p{L}\p{N}_.-]{1,120}$/u.test(row.name) ? row.name : null;
   if (!name) return null;
   const model = typeof row.model === 'string' && /^[a-zA-Z0-9_.:/+-]{1,120}$/.test(row.model) &&
     !/(?:sk[-_]|gh[pousr]_|github_pat_|glpat-|AIza|hf_|xox[baprs]-|AKIA|eyJ)[a-zA-Z\d_.-]{8,}/i.test(row.model) &&
     !row.model.includes('://') ? row.model : null;
-  return { id: `profile:${name}`, name, kind: 'profile', role: 'Hermes', profile: name,
-    model, status: 'unknown' };
+  return {name, model};
 }
 
 export function sidecarError(error) {
@@ -141,6 +141,13 @@ export async function readLive() {
   for (const list of ['agents', 'runs', 'issues']) {
     live[list] = live[list].filter(agent => typeof agent.id === 'string' && typeof agent.name === 'string').map(normalizeAgent);
   }
+  for (const field of ['recentPi', 'recentPiDelegation']) {
+    const route = snapshot?.[field];
+    if (Array.isArray(route?.nodes) && Array.isArray(route?.links)) {
+      live[field] = {...route, nodes: route.nodes.filter(node =>
+        typeof node?.id === 'string' && typeof node?.name === 'string').map(normalizeAgent)};
+    }
+  }
   if (!Array.isArray(snapshot?.runs)) {
     const active = new Set(['running', 'working', 'active', 'tool', 'generating', 'queued', 'stalled']);
     live.runs = live.agents.filter(agent => agent.kind !== 'profile' && !active.has(agent.status));
@@ -155,15 +162,10 @@ export async function readLive() {
   }));
   const profiles = new Map(live.agents.filter(agent => agent.kind === 'profile').map(agent => [agent.profile || agent.name, agent]));
   for (const row of profile.profiles) {
-    const agent = profileAgent(row);
-    if (!agent) continue;
-    if (profiles.has(agent.profile)) {
-      const existing = profiles.get(agent.profile);
-      if (!existing.model && agent.model) existing.model = agent.model;
-      continue;
-    }
-    live.agents.push(agent);
-    profiles.set(agent.profile, agent);
+    const configured = profileConfiguration(row);
+    if (!configured) continue;
+    const existing = profiles.get(configured.name);
+    if (existing && !existing.model && configured.model) existing.model = configured.model;
   }
   for (const agent of live.agents) {
     const owner = agent.kind === 'session' && profiles.get(agent.profile);

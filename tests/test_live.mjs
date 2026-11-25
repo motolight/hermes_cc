@@ -62,6 +62,20 @@ test('an authenticated snapshot may legitimately have no events', async () => {
   assert.deepEqual(result.events, []);
 });
 
+test('WebUI enriches known live profiles and preserves separate Pi topology and history', async () => {
+  const current = {id:'profile:default', kind:'profile', profile:'default', name:'default'};
+  const worker = {id:'pi-role:worker', kind:'pi-role', name:'worker', active:false};
+  const run = {id:'old-pi', kind:'pi', name:'Pi', status:'completed', active:false};
+  const route = {at:'2026-11-25T12:00:00Z', nodes:[run], links:[]};
+  mockRequests({...globalProfiles, profiles:[{name:'closed'}, {name:'default', model:'local'}]},
+    {...emptySnapshot, agents:[current], piAgents:[worker], recentPi:route, recentPiDelegation:route});
+  const result = await readLive();
+  assert.deepEqual(result.agents.map(node => [node.profile, node.model]), [['default', 'local']]);
+  assert.deepEqual(result.piAgents, [worker]);
+  assert.equal(result.recentPi.nodes[0].status, 'completed');
+  assert.equal(result.recentPiDelegation.at, route.at);
+});
+
 test('failed auxiliary reads distinguish lost authorization from an unavailable resource', async () => {
   const errors = [
     [503, 'authentication_unavailable', true],

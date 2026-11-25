@@ -759,10 +759,18 @@ def parse_metrics(body):
     return result
 
 
-def collect_systemd(scope):
+def collect_systemd(scope, hermes_home=None):
     services = {}
     reached = False
     units = dict(UNIT_NAMES)
+    gateways = {"hermes-gateway.service": "default"}
+    if hermes_home is not None:
+        names, _ = profile_databases(hermes_home)
+        for name, _ in names:
+            if name != "default":
+                unit = f"hermes-gateway-{name}.service"
+                gateways[unit] = name
+                units[unit] = "Hermes Gateway · " + name
     scopes = ("system", "user") if scope == "both" else (scope,)
     for manager in scopes:
         try:
@@ -781,10 +789,15 @@ def collect_systemd(scope):
             state = fields.get("ActiveState")
             if state not in {"active", "inactive", "failed", "activating", "deactivating", "reloading", "maintenance"}:
                 state = "unknown"
+            gateway = gateways.get(unit)
+            if gateway and gateway != "default" and state != "active":
+                continue
             if unit in services and services[unit]["status"] == "active":
                 continue
             services[unit] = {"id": unit.removesuffix(".service"), "name": units[unit],
                               "status": state, "detail": f"systemd {manager} unit"}
+            if gateway:
+                services[unit]["gatewayProfile"] = gateway
     state = "available" if services else "partial" if reached else "unavailable"
     detail = f"{len(services)} recognized systemd units reported." if reached else "No systemd status reported."
     return list(services.values()), source("systemd", "Local services", state, detail)

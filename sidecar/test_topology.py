@@ -6,7 +6,7 @@ from unittest.mock import patch
 from kanban import _detail_text
 from safe_text import display_text
 from telemetry import current_linux_owner, utc
-from topology import classify
+from topology import classify, pi_topology
 
 
 class TopologyTest(unittest.TestCase):
@@ -55,6 +55,44 @@ class TopologyTest(unittest.TestCase):
         agents, history, issues, links = classify(archive + active, edges, [], tasks, now)
         self.assertNotIn("pi", {entry["id"] for entry in agents})
         self.assertIn("pi", {entry["id"] for entry in history})
+
+    def test_closed_profiles_do_not_appear_as_live_gateways(self):
+        now = time.time()
+        nodes = [{"id": f"session:{profile}", "kind": "session", "profile": profile,
+                  "status": "ended", "active": False} for profile in ("default", "closed", "named")]
+        agents, runs, _, _ = classify(nodes, [], [], [], now, {"default", "named"})
+        self.assertEqual({"default", "named"}, {profile["profile"] for profile in agents})
+        self.assertTrue(all(profile["status"] == "ready" and not profile["active"] for profile in agents))
+        self.assertIn("session:closed", {run["id"] for run in runs})
+
+    def test_pi_inventory_and_latest_route_keep_active_and_archived_evidence_separate(self):
+        now = time.time()
+        hermes = {"id": "old-hermes", "kind": "session", "profile": "default", "status": "ended"}
+        profile = {"id": "profile:default", "kind": "profile", "profile": "default"}
+        roles = [{"id": "pi-role:reviewer", "kind": "pi-role", "active": False, "status": "configured"}]
+        nodes = [
+            {"id": "last", "kind": "pi", "status": "completed", "updatedAt": utc(now - 20)},
+            {"id": "current", "kind": "pi", "status": "running", "updatedAt": utc(now), "active": True},
+            {"id": "previous", "kind": "pi", "status": "unknown", "updatedAt": utc(now - 60)},
+            {"id": "review", "kind": "subagent", "status": "completed", "updatedAt": utc(now - 40)},
+        ]
+        edges = [{"from": "old-hermes", "to": "last", "kind": "delegation"},
+                 {"from": "previous", "to": "review", "kind": "delegation"}]
+        inventory, links, recent, delegated = pi_topology(nodes, edges, [hermes], [profile], [], roles,
+                                                          {"runtimeAvailable": True, "working": False})
+        self.assertEqual(["pi:runtime", "pi-role:reviewer"], [node["id"] for node in inventory])
+        self.assertTrue(all(not node["active"] for node in inventory))
+        self.assertEqual("working", inventory[0]["status"])
+        self.assertEqual({"integration", "configured", "execution"}, {edge["kind"] for edge in links})
+        self.assertEqual(["old-hermes", "last"], [node["id"] for node in recent["nodes"]])
+        self.assertEqual("observed", recent["nodes"][0]["status"])
+        self.assertEqual(["previous", "review"], [node["id"] for node in delegated["nodes"]])
+        self.assertEqual(utc(now - 40), delegated["at"])
+        self.assertEqual("historical", delegated["links"][0]["kind"])
+        nodes[1]["status"] = "queued"
+        inventory, _, _, _ = pi_topology(nodes, edges, [hermes], [profile], [], roles,
+                                          {"runtimeAvailable": True, "working": False})
+        self.assertEqual("ready", inventory[0]["status"])
 
     def test_display_text_redacts_known_private_material(self):
         value = display_text("Keep this\n<system_prompt>system content</system_prompt>\n"

@@ -10,6 +10,7 @@ const states = {
   idle: ['Idle', 'Свободен'], offline: ['Offline', 'Не в сети'], unavailable: ['Unavailable', 'Недоступно'],
   ready: ['Ready', 'Готов'], online: ['Online', 'В сети'], ok: ['Available', 'Доступно'],
   connected: ['Connected', 'Подключено'], unknown: ['Unknown', 'Неизвестно'],
+  configured: ['Configured', 'Настроена'], observed: ['Observed', 'Наблюдалось'],
   todo: ['To do', 'К выполнению'], backlog: ['Backlog', 'Бэклог'], in_progress: ['In progress', 'В работе'],
   cancelled: ['Cancelled', 'Отменено'], canceled: ['Canceled', 'Отменено'],
   working: ['Working', 'В работе'], generating: ['Generating', 'Генерация'], tool: ['Using tool', 'Использует инструмент'],
@@ -27,6 +28,7 @@ const kinds = {
   worker: ['Worker', 'Исполнитель'], subagent: ['Subagent', 'Субагент'],
   profile: ['Profile', 'Профиль'], session: ['Session', 'Сессия'], execution: ['Execution', 'Выполнение'],
   executor: ['Executor', 'Исполнитель'], pi: ['Pi Bridge', 'Pi Bridge'], feedback: ['Feedback', 'Обратная связь'],
+  pi_runtime: ['Pi runtime', 'Среда Pi'], pi_role: ['Open Agents role', 'Роль Open Agents'],
   tool: ['Tool event', 'Событие инструмента'], tool_call: ['Tool call', 'Вызов инструмента'],
   tool_result: ['Tool result', 'Результат инструмента'],
   approval: ['Approval', 'Согласование'],
@@ -187,14 +189,15 @@ function isCurrentWork(agent) {
 
 function teamRecords(data) {
   const agents = list(data.agents);
-  const current = agents.filter((agent) => agent.kind === 'profile' || isCurrentWork(agent));
+  const installed = list(data.piAgents);
+  const current = [...agents.filter((agent) => agent.kind === 'profile' || isCurrentWork(agent)), ...installed];
   const currentIds = new Set(current.map((agent) => agent.id));
   const history = [...list(data.runs), ...agents.filter((agent) => !currentIds.has(agent.id))];
   const issues = new Map(current.filter((agent) => agent.issue || attentionStates.has(agent.status)).map((agent) => [agent.id, agent]));
   for (const agent of list(data.issues)) {
     if (currentIds.has(agent.id) || agent.kind !== 'session') issues.set(agent.id, agent);
   }
-  return {agents, current, history, issues: [...issues.values()]};
+  return {agents, installed, current, history, issues: [...issues.values()]};
 }
 
 function issueReason(ctx, agent) {
@@ -218,8 +221,8 @@ function agentDetails(ctx, agent) {
 }
 
 function teamView(ctx, filter) {
-  const {agents, current, history, issues} = teamRecords(ctx.data);
-  const executors = current.filter((agent) => agent.kind !== 'profile');
+  const {agents, installed, current, history, issues} = teamRecords(ctx.data);
+  const executors = current.filter((agent) => agent.kind !== 'profile' && isCurrentWork(agent));
   const currentIds = new Set(current.map((agent) => agent.id));
   const groups = {
     live: current,
@@ -230,7 +233,7 @@ function teamView(ctx, filter) {
   };
   const mode = filter.teamScope || 'live';
   const choices = [
-    ['live', ctx.t('Team now', 'Команда сейчас'), ctx.t('Profiles and current executors', 'Профили и текущие исполнители'), 'accent'],
+    ['live', ctx.t('Team now', 'Команда сейчас'), ctx.t('Gateways, Pi roles and current work', 'Гейтвеи, роли Pi и текущая работа'), 'accent'],
     ['active', ctx.t('Active executors', 'Активные исполнители'), ctx.t('Working or running', 'Работают или выполняются'), 'green'],
     ['waiting', ctx.t('Waiting', 'Ожидают'), ctx.t('Queued, waiting or blocked', 'В очереди, ожидают или заблокированы'), 'amber'],
     ['issues', ctx.t('Needs attention', 'Требуют внимания'), ctx.t('Issues in the current team', 'Проблемы текущей команды'), 'red'],
@@ -243,7 +246,8 @@ function teamView(ctx, filter) {
   if (mode === 'live') results.sort((a, b) => Number(b.kind === 'profile') - Number(a.kind === 'profile'));
   const limit = filter.teamLimit || 50;
   const rows = results.slice(0, limit).map((agent) => {
-    const source = {history: ['runs', history], issues: ['issues', issues]}[mode] || ['agents', agents];
+    const source = {history: ['runs', history], issues: ['issues', issues]}[mode] ||
+      (installed.includes(agent) ? ['piAgents', installed] : ['agents', agents]);
     const [key, records] = source;
     const position = records.indexOf(agent);
     const lastActivity = shortDate(ctx, agent.issue?.lastActivityAt || agent.lastActivityAt || agent.updatedAt, true);
@@ -810,6 +814,7 @@ const renderers = {
 
 const inspectors = {
   agents: [(ctx, row) => row.name || row.id || ctx.t('Agent', 'Агент'), agentDetails],
+  piAgents: [(ctx, row) => row.name || row.id || 'Pi', agentDetails],
   runs: [(ctx, row) => row.name || row.title || row.id || ctx.t('Run', 'Запуск'), agentDetails],
   issues: [(ctx, row) => row.name || row.id || ctx.t('Agent', 'Агент'), agentDetails],
   events: [(ctx, row) => row.title || label(ctx, row.kind, kinds), eventDetails],

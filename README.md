@@ -9,7 +9,7 @@ A self-hosted extension for Hermes WebUI. It opens an operations panel from the 
 Use Python 3.10 or later on the Linux host running a trusted, single-operator global Hermes WebUI. Run the release archive as the account that owns the WebUI state. The installer discovers common checkout locations and checks the running WebUI's startup scope.
 
 ```sh
-python3 ./hermes-command-center-0.2.1.pyz install --systemd
+python3 ./hermes-command-center-0.2.2.pyz install --systemd
 ```
 
 Reload the WebUI. In **Settings → Extensions**, find **Hermes Command Center** and approve its sidecar proxy. WebUI must have authentication enabled to approve a `token-v1` sidecar. Open Command Center from the WebUI and verify that its live status is available.
@@ -21,7 +21,7 @@ For explicit paths, a manual sidecar, checksum verification, and lifecycle comma
 ## Update from v0.1.0
 
 ```sh
-python3 ./hermes-command-center-0.2.1.pyz update
+python3 ./hermes-command-center-0.2.2.pyz update
 ```
 
 Update retains saved vLLM and GPU options, enablement, and existing WebUI proxy consent. Reload the WebUI after the installer restarts the HCC sidecar. The [v0.2.0 acceptance report](docs/ACCEPTANCE-v0.2.0.md) covers source limitations and the browser checks.

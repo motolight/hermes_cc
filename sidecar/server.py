@@ -20,8 +20,11 @@ from urllib.parse import parse_qs, urlsplit
 
 from history import BackgroundCollector, HistoryStore, RANGES
 from kanban import collect_kanban, read_kanban_task
+from pi_direct import bridge_ownership, collect_pi_direct
 from pi_integration import collect_pi_bridge
-from topology import classify
+from pi_roles import read_pi_roles
+from pi_web_activity import PiWebActivity
+from topology import classify, pi_topology
 from telemetry import (
     DB_TIME_LIMIT, MetricsOrigin, bounded_read, collect_gpu, collect_hermes, collect_metrics,
     collect_pi, collect_systemd, parse_metrics_origin, source, utc,
@@ -52,6 +55,7 @@ class Config:
     history_dir: Path | None = None
     pi_bridge_home: Path | None = None
     pi_sessions: Path | None = None
+    pi_web_socket: Path | None = None
 
     @classmethod
     def from_environment(cls):
@@ -68,7 +72,8 @@ class Config:
                    scope if scope in {"user", "system", "both"} else "both", os.getenv("HCC_GPU_SSH_USER"),
                    webui_state / ".hermes-command-center" / "telemetry",
                    Path(os.getenv("PI_BRIDGE_HOME") or Path.home() / ".local/state/pi-bridge").expanduser(),
-                   Path(os.getenv("PI_CODING_AGENT_DIR") or Path.home() / ".pi/agent").expanduser() / "sessions")
+                   Path(os.getenv("PI_CODING_AGENT_DIR") or Path.home() / ".pi/agent").expanduser() / "sessions",
+                   Path.home() / ".pi-web/sessiond.sock")
 
 
 def collected(function, fallback):
@@ -91,7 +96,8 @@ def encode_snapshot(snapshot):
     if len(body) <= MAX_SNAPSHOT_BYTES:
         return body
 
-    pi_ids = {node["id"] for node in snapshot["agents"] if node.get("role") == "Pi Bridge" or node.get("kind") == "pi"}
+    pi_ids = {node["id"] for node in (*snapshot["agents"], *snapshot.get("runs", ()))
+              if node.get("source") == "pi" or node.get("kind") == "pi"}
     pi_events = [event for event in snapshot["events"] if event["from"] in pi_ids or event["to"] in pi_ids]
     hermes_events = [event for event in snapshot["events"] if event["from"] not in pi_ids and event["to"] not in pi_ids]
     pi_nodes = [node for node in snapshot["agents"] if node["id"] in pi_ids]
@@ -111,6 +117,7 @@ def encode_snapshot(snapshot):
         # services and source states in every response.
         agents = profiles + retain(pi_nodes, "pi") + retain(hermes_nodes, "hermes")
         ids = {node["id"] for node in agents}
+        topology_ids = ids | {node["id"] for node in snapshot.get("piAgents", ())}
         events = sorted(retain(pi_events, "pi") + retain(hermes_events, "hermes"),
                         key=lambda event: event["at"] or "", reverse=True)
         clipped = {
@@ -120,6 +127,8 @@ def encode_snapshot(snapshot):
             "issues": retain(snapshot.get("issues", []), "hermes"),
             "events": events,
             "links": [edge for edge in snapshot["links"] if edge["from"] in ids and edge["to"] in ids],
+            "piLinks": [edge for edge in snapshot.get("piLinks", ())
+                        if edge["from"] in topology_ids and edge["to"] in topology_ids],
             "tasks": retain(snapshot["tasks"], "kanban"),
             "usage": retain(snapshot["usage"], "hermes"),
             "gpus": [{**gpu, "history": retain(gpu.get("history", []), "gpu", newest_last=True)} for gpu in snapshot["gpus"]],
@@ -159,6 +168,7 @@ class Snapshot:
         self.source_success = {}
         self.history = None
         self.history_error = False
+        self.pi_web = PiWebActivity(config.pi_web_socket) if config.pi_web_socket is not None else None
         if config.history_dir is not None:
             try:
                 self.history = HistoryStore(config.history_dir)
@@ -166,6 +176,8 @@ class Snapshot:
                 self.history_error = True
 
     def close(self):
+        if self.pi_web is not None:
+            self.pi_web.close()
         self.pool.shutdown(wait=True)
 
     def load(self):
@@ -276,7 +288,7 @@ class Snapshot:
             ([], source("gpu", gpu_label, "unavailable", "GPU telemetry could not be read.")),
         )
         systemd = self.pool.submit(
-            collected, partial(collect_systemd, config.systemd_scope),
+            collected, partial(collect_systemd, config.systemd_scope, config.hermes_home),
             ([], source("systemd", "Local services", "unavailable", "Systemd status could not be read.")),
         )
         pi_unavailable = source("pi", "Pi Bridge and Open Agents", "unavailable", "Pi source files could not be read.")
@@ -289,15 +301,33 @@ class Snapshot:
                 collected, partial(collect_pi_bridge, config.webui_state, config.pi_bridge_home, config.pi_sessions, agents),
                 ([], [], [], [], pi_unavailable),
             )
+            roles = self.pool.submit(collected, partial(read_pi_roles, config.pi_sessions.parent),
+                                     ([], source("pi-roles", "Pi Open Agents roles", "unavailable", "Role inventory unavailable.")))
         tasks, kanban_source = kanban.result()
         gpus, gpu_source = gpu.result()
         services, systemd_source = systemd.result()
         metrics, vllm_source = self.observed_metrics(vllm.result() if vllm else None)
+        pi_links, pi_roles, pi_diagnostics, pi_web_source = [], [], [], {}
         if pi is None:
             pi_agents, pi_links, pi_events, pi_services, pi_source = native_pi.result()
-            links.extend(pi_links)
+            pi_roles, roles_source = roles.result()
+            pi_diagnostics.append(roles_source)
+            live_sessions = None
+            if self.pi_web is not None:
+                live_sessions, pi_web_source = self.pi_web.snapshot()
+                pi_diagnostics.append(pi_web_source)
+                if not pi_web_source.get("runtimeAvailable"):
+                    live_sessions = None
+            bridge_sessions, active_bridge, ended_bridge = bridge_ownership(pi_agents)
+            direct_nodes, direct_links, direct_events, direct_source = collect_pi_direct(
+                config.pi_sessions, bridge_sessions, live_sessions, active_bridge, ended_bridge)
+            pi_agents.extend(direct_nodes)
+            pi_links.extend(direct_links)
+            pi_events.extend(direct_events)
+            pi_diagnostics.append(direct_source)
         else:
             pi_agents, pi_events, pi_services, pi_source = pi.result()
+        links.extend(pi_links)
         epoch = time.time()
         now = utc(epoch)
         self.with_gpu_history(gpus, now)
@@ -312,10 +342,15 @@ class Snapshot:
         events = pi_events + events
         communications = sorted([item for item in events if item.get("channel") == "communication"], key=lambda item: item["at"] or "", reverse=True)
         technical = sorted([item for item in events if item.get("channel") != "communication"], key=lambda item: item["at"] or "", reverse=True)
-        agents, runs, issues, links = classify(pi_agents + agents, links, communications + technical, tasks, epoch)
+        gateways = {service["gatewayProfile"] for service in services
+                    if service.get("gatewayProfile") and service["status"] == "active"}
+        hermes_nodes = agents
+        agents, runs, issues, links = classify(pi_agents + hermes_nodes, links, communications + technical, tasks, epoch, gateways)
+        pi_inventory, topology_links, recent_pi, recent_delegation = pi_topology(
+            pi_agents, pi_links, hermes_nodes, agents, services, pi_roles, pi_web_source)
         # Usage retains its session ID for accounting when its graph node is
         # outside the visible agent/event window.
-        sources = [hermes_source, kanban_source, pi_source, gpu_source, vllm_source, systemd_source]
+        sources = [hermes_source, kanban_source, pi_source, *pi_diagnostics, gpu_source, vllm_source, systemd_source]
         for entry in sources:
             if entry["status"] in {"available", "partial"}:
                 self.source_success[entry["id"]] = now
@@ -333,8 +368,10 @@ class Snapshot:
                     entry.setdefault("recommendation", "Check the native board store if expected tasks are missing.")
                 entry.setdefault("impact", "Sections that rely on this source may be incomplete.")
         return {
-            "at": now, "agents": agents, "runs": runs[:MAX_OUTPUT_AGENTS], "issues": issues[:40],
+            "at": now, "agents": agents,
+            "runs": sorted(runs, key=lambda node: node.get("updatedAt") or "", reverse=True)[:MAX_OUTPUT_AGENTS], "issues": issues[:40],
             "links": links, "events": (communications + technical)[:MAX_OUTPUT_EVENTS],
+            "piAgents": pi_inventory, "piLinks": topology_links, "recentPi": recent_pi, "recentPiDelegation": recent_delegation,
             "tasks": tasks, "usage": usage[:MAX_OUTPUT_USAGE], "gpus": gpus,
             "services": services + pi_services, "metrics": metrics,
             "sources": sources,
@@ -351,6 +388,8 @@ class Server(ThreadingHTTPServer):
         self.background = None
         self.slots = threading.BoundedSemaphore(MAX_THREADS)
         super().__init__(address, Handler)
+        if self.snapshot.pi_web is not None:
+            self.snapshot.pi_web.start()
         if config.history_dir is not None:
             self.background = BackgroundCollector(self.snapshot.load, interval=BACKGROUND_INTERVAL)
             self.background.start()

@@ -15,19 +15,19 @@ The installer uses the managed gallery layout. It checks the startup scope of a 
 If the checksum file is available from a trusted source, run the following in the directory containing both release files before executing the Python archive.
 
 ```sh
-sha256sum -c hermes-command-center-0.2.1.pyz.sha256
+sha256sum -c hermes-command-center-0.2.2.pyz.sha256
 ```
 
 The archive also verifies its embedded file hash inventory before installing its payload.
 
 ```sh
-python3 ./hermes-command-center-0.2.1.pyz check
+python3 ./hermes-command-center-0.2.2.pyz check
 ```
 
 The compatibility check reads the WebUI checkout, process scope and existing installation state. It performs no installation.
 
 ```sh
-python3 ./hermes-command-center-0.2.1.pyz install --systemd
+python3 ./hermes-command-center-0.2.2.pyz install --systemd
 ```
 
 Checkout discovery includes `~/hermes-webui`, checkouts beside the WebUI state directory, and the working directory of `hermes-webui.service`. Set `HERMES_WEBUI_ROOT` or pass `--webui-root /path/to/hermes-webui` to select the intended checkout explicitly. Use `--state-dir /path/to/state` for a custom WebUI state path. The optional `--hermes-home /path/to/agent-data` sets the Hermes Agent data root for the managed sidecar. Starting the extension requires only reloading the WebUI page.
@@ -35,7 +35,7 @@ Checkout discovery includes `~/hermes-webui`, checkouts beside the WebUI state d
 If vLLM runs on another private host, add `--vllm-origin` to the install or update command. Replace the example address with the metrics listener's actual address.
 
 ```sh
-python3 ./hermes-command-center-0.2.1.pyz install --systemd --vllm-origin http://10.20.30.40:8000
+python3 ./hermes-command-center-0.2.2.pyz install --systemd --vllm-origin http://10.20.30.40:8000
 ```
 
 Use an HTTP or HTTPS origin with a loopback or RFC1918 IP literal and an explicit port. The sidecar reads the fixed `/metrics` path. Omit `--vllm-origin` for the default loopback listener on port 8000.
@@ -65,10 +65,10 @@ curl --fail --silent http://127.0.0.1:17882/health
 
 Use the same `--webui-root` and `--state-dir` for subsequent commands. For brevity the examples use the default state directory.
 
-Upgrade an existing managed installation with the v0.2.1 archive:
+Upgrade an existing managed installation with the v0.2.2 archive:
 
 ```sh
-python3 ./hermes-command-center-0.2.1.pyz update
+python3 ./hermes-command-center-0.2.2.pyz update
 ```
 
 The command uses the saved service, inference endpoint and GPU SSH configuration. Existing sidecar proxy consent stays in WebUI. The installer restarts the HCC unit and verifies its local health. Refresh WebUI to load the new extension.
@@ -77,12 +77,12 @@ During a temporary connection failure HCC retries automatically. The last succes
 
 | Operation | Command |
 | --- | --- |
-| Show local install state | `python3 ./hermes-command-center-0.2.1.pyz status --webui-root /path/to/hermes-webui` |
+| Show local install state | `python3 ./hermes-command-center-0.2.2.pyz status --webui-root /path/to/hermes-webui` |
 | Update | `python3 ./hermes-command-center-NEW.pyz update --webui-root /path/to/hermes-webui` |
-| Disable | `python3 ./hermes-command-center-0.2.1.pyz disable --webui-root /path/to/hermes-webui` |
-| Enable | `python3 ./hermes-command-center-0.2.1.pyz enable --webui-root /path/to/hermes-webui` |
-| Restore previous installation | `python3 ./hermes-command-center-0.2.1.pyz rollback --webui-root /path/to/hermes-webui` |
-| Uninstall | `python3 ./hermes-command-center-0.2.1.pyz uninstall --webui-root /path/to/hermes-webui` |
+| Disable | `python3 ./hermes-command-center-0.2.2.pyz disable --webui-root /path/to/hermes-webui` |
+| Enable | `python3 ./hermes-command-center-0.2.2.pyz enable --webui-root /path/to/hermes-webui` |
+| Restore previous installation | `python3 ./hermes-command-center-0.2.2.pyz rollback --webui-root /path/to/hermes-webui` |
+| Uninstall | `python3 ./hermes-command-center-0.2.2.pyz uninstall --webui-root /path/to/hermes-webui` |
 
 Updating preserves enablement and the user systemd choice unless you supply `--systemd` or `--no-systemd`. Rollback restores the prior HCC release or removes HCC if the prior state was a fresh installation. A rollback following an uninstall requires renewed proxy consent. The installer never grants consent or generates a token. Its uninstall clears only HCC's WebUI registry entry and overrides, removes the tracked HCC files and owned unit, and keeps one private rollback snapshot. The WebUI manages the token file. The Settings enable and disable control applies to the WebUI panel. Use the installer commands to also stop or start the managed systemd service.
 
@@ -93,6 +93,12 @@ Run installer commands separately from WebUI Settings changes in the same state 
 The HCC sidecar samples every 30 seconds when the browser is closed. The managed unit keeps its read-only filesystem policy and allows writes only in `<webui-state>/.hermes-command-center/telemetry`. On Linux the HCC directories require owner-only access and the SQLite file is created with mode 0600. Samples are retained for up to 31 days, with a 64 MiB main database budget and earlier pruning under size pressure. Uninstall and rollback leave this private history available to a later HCC installation.
 
 The four selectable display ranges are 1 hour, 24 hours, 7 days and 30 days. A first cumulative baseline stays separate. Counter resets, transitions between overlapping accounting scopes and missing sample intervals prevent ambiguous attribution. The chart dates increments by HCC observation time.
+
+## Pi topology and live activity
+
+The live graph includes the default Hermes profile, named profiles with observed current work or an active native gateway service, the Pi runtime, and configured Pi Open Agents roles. Configured roles have their own state. Older profile sessions remain in run history. The latest Pi route and, when distinct, the latest observed Open Agents route show timestamps and links from existing records.
+
+HCC reads Bridge job state and bounded Pi transcripts. For Pi Web live activity it subscribes to the same user's local `~/.pi-web/sessiond.sock` and verifies that the socket peer belongs to that user. The global feed confirms exact session activity as events arrive. Initial machine status can report work already under way before its session is identified by an event. Pi CLI transcripts can confirm an observed delegation or result, while exact current runtime requires independent evidence. The collector observes activity through existing records and events without opening a session or submitting a prompt.
 
 ## Build a release
 
