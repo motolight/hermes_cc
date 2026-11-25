@@ -1,7 +1,7 @@
 {
   "id": "hermes-command-center",
   "name": "Hermes Command Center",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "enabled": true,
   "scripts": ["web/boot.js"],
   "permissions": {

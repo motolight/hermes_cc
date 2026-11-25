@@ -2,9 +2,21 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 globalThis.document = {baseURI: 'https://webui.test/extensions/hermes-command-center/index.html'};
-const {isAccessDenied, readHistory, readLive, readTaskDetail} = await import('../web/live.js');
+const {isAccessDenied, readHistory, readLive, readTaskDetail, webuiReturnHref} = await import('../web/live.js');
 const globalProfiles = {profiles: [], single_profile_mode: false};
 const emptySnapshot = {agents: [], events: [], sources: []};
+
+test('standalone HCC returns only to a same-origin Hermes document', () => {
+  const session = 'https://webui.test/session/chat-id?panel=chat';
+  assert.equal(webuiReturnHref(session), session);
+  assert.equal(webuiReturnHref('https://webui.test/session/team.alpha'), 'https://webui.test/session/team.alpha');
+  assert.equal(webuiReturnHref('https://webui.test/sessions'), 'https://webui.test/sessions');
+  for (const value of ['', 'https://elsewhere.test/session/chat-id', 'https://webui.test/api/session',
+    'https://webui.test/extensions/hermes-command-center/web/index.html', 'https://webui.test/session/manifest.json',
+    'https://webui.test/session/static', 'javascript:alert(1)']) {
+    assert.equal(webuiReturnHref(value), 'https://webui.test/');
+  }
+});
 
 function mockRequests(profiles, snapshot) {
   const paths = [];

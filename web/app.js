@@ -1,7 +1,7 @@
 import { avatar, esc, icon, relTime, safeHref, statusChip } from './ui.js';
 import { bindGraph, renderGraph } from './graph.js';
 import { bindView, renderView } from './views.js';
-import { emptyData, isAccessDenied, readHistory, readLive, readTaskDetail, sidecarError } from './live.js';
+import { emptyData, isAccessDenied, readHistory, readLive, readTaskDetail, sidecarError, webuiReturnHref } from './live.js';
 
 const pages = {
   graph: ['Live Agent Graph', 'Граф агентов', 'Agent topology and recent handoffs', 'Связи агентов и недавние передачи задач'],
@@ -23,6 +23,7 @@ const savePref = (key, value) => {
 
 const params = new URLSearchParams(location.search);
 const embedded = parent !== window && location.protocol === 'about:';
+const returnHref = webuiReturnHref(document.referrer);
 const STALE_WINDOW = 45000;
 const RETRY_DELAY = 2000;
 const state = {
@@ -119,6 +120,10 @@ function navigate(view) {
 function renderShell() {
   document.documentElement.lang = state.lang;
   document.documentElement.dataset.theme = state.theme;
+  const exitLabel = t('Return to Hermes WebUI', 'Вернуться в Hermes WebUI');
+  const exitControl = embedded
+    ? `<button type="button" class="hcc-icon" id="hcc-exit" title="${exitLabel}" aria-label="${exitLabel}">${icon('close')}</button>`
+    : returnHref ? `<a class="hcc-icon" href="${esc(returnHref)}" title="${exitLabel}" aria-label="${exitLabel}">${icon('close')}</a>` : '';
   shell.innerHTML = `
     <header class="hcc-masthead">
       <div class="hcc-brand"><span class="hcc-mark">${icon('logo', 23)}</span><div><strong>Hermes</strong><span>Command Center</span></div></div>
@@ -128,7 +133,7 @@ function renderShell() {
         <button type="button" class="hcc-icon" id="hcc-refresh" aria-label="${t('Refresh data', 'Обновить данные')}" title="${t('Refresh data', 'Обновить данные')}">${icon('refresh')}</button>
         <button type="button" class="hcc-icon" id="hcc-theme" aria-label="${t('Toggle theme', 'Переключить тему')}" title="${t('Toggle theme', 'Переключить тему')}">${icon(state.theme === 'dark' ? 'sun' : 'moon')}</button>
         <button type="button" class="hcc-icon hcc-lang" id="hcc-lang" aria-label="${t('Switch to Russian', 'Switch to English')}">${state.lang.toUpperCase()}</button>
-        ${embedded ? `<button type="button" class="hcc-icon" id="hcc-exit" title="${t('Return to Hermes WebUI', 'Вернуться в Hermes WebUI')}" aria-label="${t('Return to Hermes WebUI', 'Вернуться в Hermes WebUI')}">${icon('close')}</button>` : ''}
+        ${exitControl}
       </div>
     </header>
     <div class="hcc-layout">

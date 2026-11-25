@@ -21,6 +21,21 @@ export function webuiHref(path) {
   return link.origin === host.origin ? link.href : '';
 }
 
+export function webuiReturnHref(referrer) {
+  if (!host.pathname.includes(extensionDirectory)) return '';
+  try {
+    const previous = new URL(referrer);
+    if (previous.origin === root.origin && !previous.username && !previous.password &&
+        previous.pathname.startsWith(root.pathname)) {
+      const page = previous.pathname.slice(root.pathname.length);
+      const session = page.match(/^session\/([a-zA-Z0-9_.-]{1,120})\/?$/)?.[1];
+      const reserved = ['static', 'extensions', 'manifest.json', 'manifest.webmanifest'];
+      if (['', 'index.html', 'sessions'].includes(page) || (session && !reserved.includes(session))) return previous.href;
+    }
+  } catch { /* A bookmarked entry has no previous WebUI page. */ }
+  return root.href;
+}
+
 async function request(path) {
   const response = await fetch(webuiHref(path), {
     signal: AbortSignal.timeout(6500), cache: 'no-store', credentials: 'same-origin',

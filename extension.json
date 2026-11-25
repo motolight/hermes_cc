@@ -1,7 +1,7 @@
 {
   "id": "hermes-command-center",
   "name": "Hermes Command Center",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Read-only agent topology, Kanban, usage and infrastructure for Hermes WebUI.",
   "repository": "https://github.com/motolight/hermes_cc"
 }
